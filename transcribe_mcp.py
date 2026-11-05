@@ -9,7 +9,7 @@
   read_pdf_text        : 강의 PDF의 페이지별 텍스트
   save_book            : Claude가 쓴 책 원고를 .md + 보기 좋은 .html로 저장
 
-등록은 setup.bat이 해줌. 수동 등록은 README 참고.
+등록은 setup.bat(Windows) / setup.sh(macOS)가 해줌. 수동 등록은 README 참고.
 """
 import asyncio
 import os
@@ -42,7 +42,7 @@ mcp = FastMCP(
         "사용자 PC의 녹음·영상과 강의 노트(삼성노트 .sdocx, PDF)를 로컬에서 처리하는 도구입니다.\n"
         "[녹음 변환] 경로를 모르면 find_recordings로 찾고, 애매하면 사용자에게 확인하세요. "
         "start_transcription 후 get_transcription을 status가 done이 될 때까지 반복 호출하세요. "
-        "CPU라 1시간 녹음이면 수십 분 걸릴 수 있으니 진행률을 짧게 알려주세요. "
+        "CPU로 돌면 1시간 녹음에 수십 분 걸릴 수 있으니(GPU·Apple Silicon은 훨씬 빠름) 진행률을 짧게 알려주세요. "
         "한국어는 engine='ko'(기본), 다른 언어는 engine='whisper'와 language 코드를 쓰세요.\n"
         "[강의를 책으로] 사용자가 노트/PDF와 녹음을 바탕으로 정리·책·요약을 원하면: "
         "1) prepare_lecture_note로 노트를 풀고 녹음 변환을 시작, "
@@ -104,7 +104,7 @@ def _duration(path: Path):
 
 def _default_folders():
     home = Path.home()
-    names = ["Downloads", "Desktop", "Documents", "Music", "Videos",
+    names = ["Downloads", "Desktop", "Documents", "Music", "Videos", "Movies",
              "Documents/Sound recordings", "Documents/녹음"]
     roots = [home]
     onedrive = os.environ.get("OneDrive")
@@ -143,7 +143,9 @@ def _status_text(job, timestamps, offset, max_chars):
             head.append(f"elapsed: {tr.fmt(elapsed)}")
             if p > 0.03:
                 head.append(f"eta: 약 {tr.fmt(elapsed / p - elapsed)}")
-            elif job["engine"] == "ko" and not (tr.KO_DIR / "model.bin").exists():
+            elif job["engine"] == "ko" and not (
+                    (tr.KO_MLX_DIR / "weights.safetensors") if tr.mlx_available()
+                    else (tr.KO_DIR / "model.bin")).exists():
                 head.append("note: 한국어 모델 최초 변환 중일 수 있음 (몇 분)")
         else:
             head.append(f"queue_position: {list(job_queue.queue).index(job['id']) + 1 if job['id'] in job_queue.queue else '?'}")
@@ -333,7 +335,7 @@ def read_pdf_text(pdf_path: str, pages: str = "", max_chars: int = 40000) -> str
     try:
         n, text = lt.pdf_text(path, pages)
     except ImportError:
-        return "pypdf가 설치돼 있지 않아요. setup.bat을 다시 실행해주세요."
+        return "pypdf가 설치돼 있지 않아요. 설치 스크립트(setup.bat 또는 setup.sh)를 다시 실행해주세요."
     except Exception as e:  # noqa: BLE001
         return f"PDF를 읽지 못했어요: {type(e).__name__}: {e}"
     _book_dir(path)
@@ -358,7 +360,7 @@ def save_book(folder: str, title: str, markdown: str) -> str:
     try:
         html_path.write_text(lt.markdown_to_book_html(markdown, title), encoding="utf-8")
     except ImportError:
-        return f"원고는 저장했어요: {md_path}\nHTML 변환용 markdown 패키지가 없어요. setup.bat을 다시 실행해주세요."
+        return f"원고는 저장했어요: {md_path}\nHTML 변환용 markdown 패키지가 없어요. 설치 스크립트(setup.bat 또는 setup.sh)를 다시 실행해주세요."
     return (f"저장 완료\n- 책(브라우저로 열기, Ctrl+P로 PDF 저장 가능): {html_path}\n- 원고: {md_path}\n"
             f"- 형광펜 {markdown.count('==') // 2}곳, 시험 포인트 {markdown.count('시험 포인트')}곳")
 

@@ -271,14 +271,16 @@ def test_cohere_loop_piece_is_split_and_retried(monkeypatch):
 
 
 # ---------- GPU 선택·DirectML·자가 진단 ----------
-@pytest.mark.parametrize("cuda,intel,dml,gpu,expected", [
-    (True, True, True, None, "cuda"),
-    (False, True, True, None, "openvino"),
-    (False, False, True, None, "directml"),
-    (False, False, False, None, "cpu"),
-    (True, True, True, False, "cpu"),          # --cpu 강제
+@pytest.mark.parametrize("mlx,cuda,intel,dml,gpu,expected", [
+    (True, False, False, False, None, "mlx"),
+    (False, True, True, True, None, "cuda"),
+    (False, False, True, True, None, "openvino"),
+    (False, False, False, True, None, "directml"),
+    (False, False, False, False, None, "cpu"),
+    (True, True, True, True, False, "cpu"),          # --cpu 강제
 ])
-def test_gpu_backend_order(monkeypatch, cuda, intel, dml, gpu, expected):
+def test_gpu_backend_order(monkeypatch, mlx, cuda, intel, dml, gpu, expected):
+    monkeypatch.setattr(tr, "mlx_available", lambda: mlx)
     monkeypatch.setattr(tr, "cuda_available", lambda: cuda)
     monkeypatch.setattr(tr, "intel_gpu_available", lambda: intel)
     monkeypatch.setattr(tr, "directml_available", lambda: dml)
@@ -316,7 +318,8 @@ def test_stale_export_folders_are_cleaned(tmp_path):
 
 
 def test_doctor_reports_and_skips_test_without_models(monkeypatch, tmp_path):
-    for name in ("KO_DIR", "KO_OV_DIR", "KO_ONNX_DIR", "LARGE_V3_OV_DIR", "LARGE_V3_TURBO_OV_DIR"):
+    for name in ("KO_DIR", "KO_MLX_DIR", "KO_OV_DIR", "KO_ONNX_DIR", "LARGE_V3_OV_DIR",
+                 "LARGE_V3_TURBO_OV_DIR"):
         monkeypatch.setattr(tr, name, tmp_path / name)
     monkeypatch.setattr(tr, "_WHISPER_ONNX_DIRS", {k: tmp_path / k for k in tr._WHISPER_ONNX_DIRS})
     monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "cpu")
@@ -329,4 +332,72 @@ def test_install_rejects_conflicting_gpu_options():
     root = Path(__file__).resolve().parents[1]
     r = subprocess.run([sys.executable, str(root / "install.py"), "--amd-gpu", "--intel-gpu"],
                        capture_output=True, text=True)
-    assert r.returncode == 2 and ("Windows only" in r.stderr or "Choose one" in r.stderr)
+    # 운영체제에 따라 먼저 걸리는 검사가 다름 (macOS에서는 --intel-gpu 자체가 거부됨)
+    assert r.returncode == 2 and any(m in r.stderr for m in ("Windows only", "Choose one", "requires x86-64"))
+
+
+# ---------- Apple Silicon (MLX) ----------
+def test_hf_to_mlx_weight_names():
+    assert tr._hf_to_mlx_name("model.encoder.layers.3.self_attn.q_proj.weight") == "encoder.blocks.3.attn.query.weight"
+    assert tr._hf_to_mlx_name("model.decoder.layers.0.encoder_attn.k_proj.weight") == "decoder.blocks.0.cross_attn.key.weight"
+    assert tr._hf_to_mlx_name("model.decoder.layers.1.encoder_attn_layer_norm.bias") == "decoder.blocks.1.cross_attn_ln.bias"
+    assert tr._hf_to_mlx_name("model.encoder.layers.2.fc2.weight") == "encoder.blocks.2.mlp2.weight"
+    assert tr._hf_to_mlx_name("model.encoder.layers.2.final_layer_norm.weight") == "encoder.blocks.2.mlp_ln.weight"
+    assert tr._hf_to_mlx_name("model.decoder.embed_tokens.weight") == "decoder.token_embedding.weight"
+    assert tr._hf_to_mlx_name("model.decoder.embed_positions.weight") == "decoder.positional_embedding"
+    assert tr._hf_to_mlx_name("model.encoder.layer_norm.weight") == "encoder.ln_post.weight"
+    assert tr._hf_to_mlx_name("model.decoder.layer_norm.bias") == "decoder.ln.bias"
+    assert tr._hf_to_mlx_name("model.encoder.embed_positions.weight") is None
+    assert tr._hf_to_mlx_name("proj_out.weight") is None
+
+
+def test_clips_in_merges_close_speech_and_skips_silence():
+    spans = [(1.0, 2.0), (3.0, 4.0), (20.0, 25.0), (40.0, 50.0)]
+    # 조각 [0, 30] 기준 상대 시간. 1초 틈은 합치고 16초 무음은 건너뜀, 조각 밖 구간은 버림
+    rounded = lambda clips: [[round(x, 3) for x in c] for c in clips]  # noqa: E731
+    assert rounded(tr._clips_in(spans, 0.0, 30.0)) == [[0.8, 4.2], [19.8, 25.2]]
+    assert rounded(tr._clips_in(spans, 30.0, 45.0)) == [[9.8, 15.0]]
+
+
+def test_run_mlx_offsets_clips_and_recovers_loops(monkeypatch):
+    import types
+    import numpy as np
+    loop = "같은 말을 계속 반복합니다 " * 8
+    calls = []
+
+    def fake_rows(model, audio, lang, **options):
+        calls.append((len(audio) / tr.SR, options))
+        return [(0.5, "재시도 성공")] if options else [(0.5, loop.strip())]
+
+    monkeypatch.setitem(sys.modules, "mlx", types.ModuleType("mlx"))
+    monkeypatch.setitem(sys.modules, "mlx.core", types.SimpleNamespace(float16="f16"))
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.ModuleType("mlx_whisper"))
+    monkeypatch.setitem(sys.modules, "mlx_whisper.transcribe",
+                        types.SimpleNamespace(ModelHolder=types.SimpleNamespace(get_model=lambda *a: None)))
+    monkeypatch.setattr(tr, "_decode_from", lambda audio, start: (np.zeros(60 * tr.SR, np.float32), 70.0))
+    monkeypatch.setattr(tr, "_speech_spans", lambda wav, sr: [(10.0, 12.0), (40.0, 41.0)])
+    monkeypatch.setattr(tr, "_mlx_rows", fake_rows)
+    progress = []
+    rows = list(tr.run_mlx("a.m4a", "m", start_at=10.0, on_progress=progress.append))
+    # 말소리 구간마다 따로 변환, 시각 = 이어하기 시작 + 구간 시작 + 줄 시작
+    assert [round(t, 1) for t, _ in rows] == [20.3, 50.3]
+    assert [text for _, text in rows] == ["재시도 성공", "재시도 성공"]
+    assert progress[-1] == 1.0
+
+
+def test_mlx_start_failure_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "mlx")
+    monkeypatch.setattr(tr, "ensure_ko_mlx_model", lambda: (_ for _ in ()).throw(tr._MLXStartError("no mlx")))
+    monkeypatch.setattr(tr, "ensure_ko_model", lambda: "ct2")
+    monkeypatch.setattr(tr, "run_whisper", lambda *a, **k: iter([(0.0, "CPU로 변환")]))
+    assert list(tr.run_ko("a.m4a")) == [(0.0, "CPU로 변환")]
+
+
+def test_whisper_engine_uses_mlx_repo_on_apple_silicon(monkeypatch):
+    seen = []
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "mlx")
+    monkeypatch.setattr(tr, "run_mlx", lambda audio, model, lang, **k: seen.append(model) or iter([(0.0, "ok")]))
+    monkeypatch.setattr(tr, "run_whisper", lambda *a, **k: seen.append("cpu") or iter([(0.0, "cpu")]))
+    list(tr.transcribe("a.m4a", "whisper", "en", "small"))
+    list(tr.transcribe("a.m4a", "whisper", "en", "/local/ct2-model"))   # MLX 변환본이 없는 로컬 모델은 CPU
+    assert seen == ["mlx-community/whisper-small-mlx", "cpu"]

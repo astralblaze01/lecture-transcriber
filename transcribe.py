@@ -11,7 +11,8 @@
   python transcribe.py 녹음.m4a                       # ko 엔진
   python transcribe.py 녹음.m4a --engine whisper --model large-v3-turbo --lang en
   python transcribe.py 녹음.m4a --engine cohere
-  (GPU 자동 사용: NVIDIA → CUDA, 인텔 내장/Arc → OpenVINO(ko 엔진), 없으면 CPU. --cpu로 끌 수 있음)
+  (GPU 자동 사용: Apple Silicon Mac → MLX, NVIDIA → CUDA, 인텔 내장/Arc → OpenVINO,
+   그 밖의 DX12 GPU(AMD 등) → DirectML, 없으면 CPU. --cpu로 끌 수 있음)
 결과
   녹음.<engine>.txt 가 같은 폴더에 생성
 
@@ -123,7 +124,7 @@ def ensure_ko_model():
         from huggingface_hub import list_repo_files
     except ImportError as e:
         raise RuntimeError(
-            "한국어 모델 변환에 필요한 패키지가 없어요. setup.bat을 다시 실행하거나:\n"
+            "한국어 모델 변환에 필요한 패키지가 없어요. setup.bat(Windows)/setup.sh(macOS)를 다시 실행하거나:\n"
             "  pip install ctranslate2 transformers torch huggingface_hub"
         ) from e
 
@@ -188,10 +189,12 @@ def _retry_whisper_loop(model, wav, start, end, lang):
 
 
 def gpu_backend(gpu=None) -> str:
-    """쓸 가속 방식. 자동 순서: NVIDIA(CUDA) → 인텔 GPU(OpenVINO) → 그 밖의 DX12 GPU(DirectML, AMD 등) → CPU.
-    gpu=False면 항상 'cpu'."""
+    """쓸 가속 방식. 자동 순서: Apple Silicon(MLX) → NVIDIA(CUDA) → 인텔 GPU(OpenVINO)
+    → 그 밖의 DX12 GPU(DirectML, AMD 등) → CPU. gpu=False면 항상 'cpu'."""
     if gpu is False:
         return "cpu"
+    if mlx_available():
+        return "mlx"
     if cuda_available():
         return "cuda"
     if intel_gpu_available():
@@ -204,6 +207,10 @@ def gpu_backend(gpu=None) -> str:
 def run_ko(audio, gpu=None, on_progress=None, start_at=0.0, **_):
     backend = gpu_backend(gpu)
     try:
+        if backend == "mlx":
+            yield from run_mlx(audio, ensure_ko_mlx_model(), "ko", on_progress=on_progress,
+                               start_at=start_at)
+            return
         if backend == "openvino":
             yield from run_openvino(audio, ensure_ko_ov_model(), "ko", on_progress=on_progress,
                                     start_at=start_at)
@@ -329,17 +336,25 @@ def _ensure_ov_model(repo: str, model_dir: Path) -> str:
         log(f"변환 완료: {model_dir}")
         return str(model_dir)
 
-def _cut_points(wav, sr, target_s=300):
-    """긴 녹음을 약 target_s초 단위로 자르되, 말하는 중간이 아니라 조용한 틈에서 자름."""
-    total = len(wav) / sr
-    if total <= target_s * 1.2:
-        return [0.0, total]
+def _speech_spans(wav, sr):
+    """말소리 구간 [(시작초, 끝초), ...]. VAD를 못 쓰면 None."""
     try:
         from faster_whisper.vad import VadOptions, get_speech_timestamps
         speech = get_speech_timestamps(wav, VadOptions(min_silence_duration_ms=300))
-        gaps = [(a["end"] + b["start"]) / 2 / sr for a, b in zip(speech, speech[1:])]
     except Exception:  # noqa: BLE001
-        gaps = []
+        return None
+    return [(s["start"] / sr, s["end"] / sr) for s in speech]
+
+
+def _cut_points(wav, sr, target_s=300, spans=None):
+    """긴 녹음을 약 target_s초 단위로 자르되, 말하는 중간이 아니라 조용한 틈에서 자름.
+    spans(말소리 구간)를 이미 구했으면 넘겨서 VAD를 다시 돌리지 않게 할 수 있음."""
+    total = len(wav) / sr
+    if total <= target_s * 1.2:
+        return [0.0, total]
+    if spans is None:
+        spans = _speech_spans(wav, sr) or []
+    gaps = [(a[1] + b[0]) / 2 for a, b in zip(spans, spans[1:])]
     # 목표 지점 앞뒤 window초 안의 조용한 틈 중 가장 가까운 곳에서 자르고, 조각은 최소 min_len초
     window, min_len = min(30.0, target_s * 0.4), min(30.0, target_s * 0.5)
     cuts, t = [0.0], target_s
@@ -564,6 +579,186 @@ def _run_whisper_onnx(audio, lang, model, gpu, on_progress, start_at):
     yield from run_whisper(audio, lang, model, gpu, on_progress, start_at)
 
 
+# ---------- Apple Silicon (MLX) ----------
+KO_MLX_DIR = HERE / "models" / "batisay-ko-turbo-mlx"
+# whisper 엔진 --model 이름 → mlx-community 변환본
+MLX_WHISPER_REPOS = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "turbo": "mlx-community/whisper-large-v3-turbo",
+}
+
+
+class _MLXStartError(_GPUStartError):
+    """MLX(Apple GPU) 시작 실패."""
+
+
+def mlx_available() -> bool:
+    """Apple Silicon Mac이고 mlx-whisper가 설치돼 있으면 True."""
+    if sys.platform != "darwin" or os.environ.get("TRANSCRIBE_NO_MLX"):
+        return False
+    import platform
+    if platform.machine() != "arm64":
+        return False
+    try:
+        import mlx.core  # noqa: F401
+        import mlx_whisper  # noqa: F401
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _hf_to_mlx_name(k):
+    """Hugging Face Whisper 가중치 이름 → mlx-whisper(OpenAI 형식) 이름. 안 쓰는 건 None."""
+    if k.startswith("model."):
+        k = k[len("model."):]
+    if k in ("encoder.embed_positions.weight", "proj_out.weight"):
+        return None  # 인코더 위치 임베딩은 mlx가 직접 계산, 출력층은 토큰 임베딩과 공유
+    for a, b in [
+        ("decoder.embed_tokens.", "decoder.token_embedding."),
+        ("decoder.embed_positions.weight", "decoder.positional_embedding"),
+        ("encoder.layer_norm.", "encoder.ln_post."),
+        ("decoder.layer_norm.", "decoder.ln."),
+        (".layers.", ".blocks."),
+        (".self_attn_layer_norm.", ".attn_ln."),
+        (".encoder_attn_layer_norm.", ".cross_attn_ln."),
+        (".final_layer_norm.", ".mlp_ln."),
+        (".self_attn.", ".attn."),
+        (".encoder_attn.", ".cross_attn."),
+        (".q_proj.", ".query."),
+        (".k_proj.", ".key."),
+        (".v_proj.", ".value."),
+        (".out_proj.", ".out."),
+        (".fc1.", ".mlp1."),
+        (".fc2.", ".mlp2."),
+    ]:
+        k = k.replace(a, b)
+    return k
+
+
+def ensure_ko_mlx_model():
+    """한국어 모델을 MLX 형식(fp16)으로 최초 1회 변환. torch 없이 safetensors만으로 변환.
+    임시 폴더에서 끝까지 만든 뒤에만 옮겨서 반쯤 된 폴더가 안 남음."""
+    import json
+    import shutil
+    import tempfile
+
+    with _models_lock:
+        if (KO_MLX_DIR / "weights.safetensors").is_file():
+            return str(KO_MLX_DIR)
+        log(f"[최초 1회] {KO_REPO} 를 Apple GPU(MLX) 형식으로 변환합니다...")
+        try:
+            import mlx.core as mx
+            from huggingface_hub import hf_hub_download
+
+            cfg = json.loads(Path(hf_hub_download(KO_REPO, "config.json")).read_text(encoding="utf-8"))
+            src = mx.load(hf_hub_download(KO_REPO, "model.safetensors"))
+            weights = {}
+            for k, v in src.items():
+                name = _hf_to_mlx_name(k)
+                if name is None:
+                    continue
+                if name.endswith(("conv1.weight", "conv2.weight")):
+                    v = v.swapaxes(1, 2)  # torch (out, in, k) → mlx (out, k, in)
+                weights[name] = v.astype(mx.float16)
+            dims = {
+                "n_mels": cfg["num_mel_bins"],
+                "n_audio_ctx": cfg["max_source_positions"],
+                "n_audio_state": cfg["d_model"],
+                "n_audio_head": cfg["encoder_attention_heads"],
+                "n_audio_layer": cfg["encoder_layers"],
+                "n_vocab": cfg["vocab_size"],
+                "n_text_ctx": cfg["max_target_positions"],
+                "n_text_state": cfg["d_model"],
+                "n_text_head": cfg["decoder_attention_heads"],
+                "n_text_layer": cfg["decoder_layers"],
+            }
+            KO_MLX_DIR.parent.mkdir(parents=True, exist_ok=True)
+            _clean_stale_exports(KO_MLX_DIR.parent)
+            with tempfile.TemporaryDirectory(dir=KO_MLX_DIR.parent) as temp:
+                staging = Path(temp) / "model"
+                staging.mkdir()
+                (staging / "config.json").write_text(
+                    json.dumps({**dims, "model_type": "whisper"}, indent=2), encoding="utf-8")
+                mx.save_safetensors(str(staging / "weights.safetensors"), weights)
+                if KO_MLX_DIR.exists():
+                    shutil.rmtree(KO_MLX_DIR)  # 예전에 덜 만들어진 폴더
+                staging.rename(KO_MLX_DIR)
+        except Exception as e:  # noqa: BLE001
+            raise _MLXStartError(f"MLX 변환 실패: {type(e).__name__}: {e}") from e
+        log(f"변환 완료: {KO_MLX_DIR}")
+        return str(KO_MLX_DIR)
+
+
+def _clips_in(spans, a, b, pad=0.2, join=3.0):
+    """[a, b] 구간 안의 말소리 구간을 조각 기준 상대 시간으로. 가까운 구간은 합침."""
+    out = []
+    for s, e in spans:
+        s, e = max(s - pad, a), min(e + pad, b)
+        if e <= s:
+            continue
+        s, e = s - a, e - a
+        if out and s - out[-1][1] < join:
+            out[-1][1] = e
+        else:
+            out.append([s, e])
+    return out
+
+
+def _mlx_rows(model, audio, lang, **options):
+    import mlx_whisper
+    with _models_lock:  # mlx-whisper의 모델 캐시는 전역 하나라 동시에 부르지 않게
+        res = mlx_whisper.transcribe(audio, path_or_hf_repo=model, language=lang, task="transcribe",
+                                     verbose=None, condition_on_previous_text=False, **options)
+    return [(seg["start"], seg["text"].strip()) for seg in res.get("segments", [])
+            if seg["text"].strip()]
+
+
+def run_mlx(audio, model, lang="ko", on_progress=None, start_at=0.0):
+    """Apple Silicon GPU로 변환. 약 5분 조각씩 처리해서 진행률·이어하기가 되게 함.
+    조용한 구간은 건너뜀(faster-whisper의 vad_filter와 같은 역할, 무음에서 헛말 방지).
+    mlx-whisper의 clip_timestamps는 구간 사이를 실제로 건너뛰지 않아서 말소리 구간마다 따로 부름."""
+    try:
+        import mlx.core as mx
+        from mlx_whisper.transcribe import ModelHolder
+        wav, total = _decode_from(audio, start_at)
+        spans = _speech_spans(wav, SR)
+        with _models_lock:
+            if ("mlx", model) not in _models:
+                log(f"모델 로드 중: {model} (Apple GPU, MLX)")
+                ModelHolder.get_model(model, mx.float16)  # 내려받기·로드 실패를 여기서 잡아 CPU로 넘김
+                _models[("mlx", model)] = True
+    except Exception as e:  # noqa: BLE001
+        raise _MLXStartError(f"{type(e).__name__}: {e}") from e
+
+    cuts = _cut_points(wav, SR, spans=spans)
+    for a, b in zip(cuts, cuts[1:]):
+        clips = _clips_in(spans, a, b) if spans is not None else [[0.0, b - a]]
+        for cs, ce in clips:
+            piece = wav[int((a + cs) * SR):int((a + ce) * SR)]
+            rows = _mlx_rows(model, piece, lang)
+            retry = lambda clip: _mlx_rows(model, clip, lang, temperature=(0.2, 0.4, 0.6))  # noqa: E731
+            for offset, text in _retry_loops(retry, piece, SR, rows):
+                yield start_at + a + cs + offset, text
+        if on_progress and total:
+            on_progress(min((start_at + b) / total, 1.0))
+
+
+def _run_whisper_mlx(audio, lang, model, gpu, on_progress, start_at):
+    try:
+        yield from run_mlx(audio, MLX_WHISPER_REPOS[model], lang, on_progress=on_progress,
+                           start_at=start_at)
+        return
+    except _MLXStartError as exc:
+        log(f"{model} Apple GPU(MLX) 시작 실패, CPU로 전환: {exc}")
+    yield from run_whisper(audio, lang, model, gpu, on_progress, start_at)
+
+
 COHERE_REPO = "CohereLabs/cohere-transcribe-03-2026"
 COHERE_PIECE_S = 20      # Cohere는 타임스탬프를 안 줘서, 이 길이로 잘라 조각 시작 시각을 타임스탬프로 씀
 COHERE_BATCH = 4
@@ -633,7 +828,13 @@ def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, 
     if engine == "ko":
         return run_ko(audio, gpu=gpu, on_progress=on_progress, start_at=start_at)
     if engine == "whisper":
-        backend = gpu_backend(gpu) if model in _WHISPER_OV_DIRS else "other"
+        backend = gpu_backend(gpu)
+        if backend == "mlx":
+            if model in MLX_WHISPER_REPOS:
+                return _run_whisper_mlx(audio, lang, model, gpu, on_progress, start_at)
+            return run_whisper(audio, lang, model, gpu, on_progress, start_at)
+        if model not in _WHISPER_OV_DIRS:
+            backend = "other"
         if backend == "openvino":
             return _run_whisper_openvino(audio, lang, model, gpu, on_progress, start_at)
         if backend == "directml":
@@ -798,7 +999,7 @@ def doctor(run_test: bool = True) -> str:
     import wave
 
     lines = [f"Python {platform.python_version()} · {platform.system()} {platform.release()} ({platform.machine()})"]
-    pkgs = ["faster-whisper", "ctranslate2", "av", "openvino", "openvino-genai", "onnxruntime",
+    pkgs = ["faster-whisper", "ctranslate2", "av", "mlx", "mlx-whisper", "openvino", "openvino-genai", "onnxruntime",
             "onnxruntime-directml", "optimum", "optimum-intel", "optimum-onnx", "transformers", "torch"]
     lines.append("패키지: " + ", ".join(f"{p} {v}" for p in pkgs if (v := _version(p))))
 
@@ -810,6 +1011,7 @@ def doctor(run_test: bool = True) -> str:
     except Exception:  # noqa: BLE001
         providers = []
     lines += [
+        f"Apple Silicon(MLX): {'사용 가능' if mlx_available() else '없음'}",
         f"NVIDIA CUDA: {'있음' if cuda else '없음'}",
         f"인텔 GPU(OpenVINO): {ov or '없음'}",
         f"ONNX Runtime 실행 장치: {', '.join(providers) or '없음'}"
@@ -819,7 +1021,7 @@ def doctor(run_test: bool = True) -> str:
     lines.append(f"자동 선택: {backend}")
     lines.append(f"결과 저장 폴더: {output_root()}")
 
-    models = {"ko (CPU·CUDA)": KO_DIR, "ko (인텔 GPU)": KO_OV_DIR, "ko (DirectML)": KO_ONNX_DIR,
+    models = {"ko (CPU·CUDA)": KO_DIR, "ko (Apple GPU)": KO_MLX_DIR, "ko (인텔 GPU)": KO_OV_DIR, "ko (DirectML)": KO_ONNX_DIR,
               "large-v3 (인텔 GPU)": LARGE_V3_OV_DIR, "large-v3-turbo (인텔 GPU)": LARGE_V3_TURBO_OV_DIR,
               "large-v3 (DirectML)": _WHISPER_ONNX_DIRS["large-v3"],
               "large-v3-turbo (DirectML)": _WHISPER_ONNX_DIRS["large-v3-turbo"]}
@@ -832,7 +1034,7 @@ def doctor(run_test: bool = True) -> str:
     if not run_test:
         return "\n".join(lines)
 
-    need = {"cuda": KO_DIR, "openvino": KO_OV_DIR, "directml": KO_ONNX_DIR, "cpu": KO_DIR}[backend]
+    need = {"mlx": KO_MLX_DIR, "cuda": KO_DIR, "openvino": KO_OV_DIR, "directml": KO_ONNX_DIR, "cpu": KO_DIR}[backend]
     if not need.is_dir():
         lines.append(f"실행 확인: 건너뜀 — {backend}용 한국어 모델이 아직 준비되지 않았어요 (install.py 또는 setup.bat 실행)")
         return "\n".join(lines)
@@ -851,7 +1053,10 @@ def doctor(run_test: bool = True) -> str:
             w.writeframes((sig * 32767).astype("<i2").tobytes())
         start = time.time()
         try:
-            if backend == "openvino":
+            if backend == "mlx":
+                list(run_mlx(str(wav_path), str(KO_MLX_DIR), "ko"))
+                where = "MLX (Apple GPU)"
+            elif backend == "openvino":
                 list(run_openvino(str(wav_path), str(KO_OV_DIR), "ko"))
                 where = f"OpenVINO {ov}"
             elif backend == "directml":
@@ -878,7 +1083,7 @@ def main():
     p.add_argument("--lang", default="ko")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--gpu", dest="gpu", action="store_const", const=True,
-                   help="GPU 사용 (NVIDIA CUDA, 지원 모델은 Intel OpenVINO·DirectML)")
+                   help="GPU 사용 (Apple Silicon MLX, NVIDIA CUDA, 지원 모델은 Intel OpenVINO·DirectML)")
     g.add_argument("--cpu", dest="gpu", action="store_const", const=False, help="CPU 강제 사용")
     p.add_argument("--force", action="store_true", help="이미 변환된 결과가 있어도 처음부터 다시")
     p.add_argument("--choose-model", action="store_true", help="녹음과 음성 인식 모델을 직접 선택")

@@ -55,6 +55,10 @@ def main():
     if args.nvidia_gpu:
         # CTranslate2(faster-whisper)용 cuBLAS·cuDNN. CUDA Toolkit을 따로 설치하지 않아도 됨
         run("-m", "pip", "install", "nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10")
+    apple_silicon = system == "Darwin" and platform.machine() == "arm64"
+    if apple_silicon:
+        # Apple Silicon GPU(Metal)로 실행하는 MLX판 Whisper
+        run("-m", "pip", "install", "mlx-whisper")
     if args.amd_gpu:
         # onnxruntime(CPU)과 onnxruntime-directml은 같은 모듈 이름을 써서, CPU판을 지우고 DirectML판을 깖.
         # DirectML판에도 CPU 실행이 들어 있어 faster-whisper의 음성 구간 감지(VAD)는 그대로 동작함.
@@ -63,6 +67,9 @@ def main():
     if not args.skip_models:
         # 첫 변환 때 몇 분씩 멈춘 것처럼 보이지 않도록, 한국어 모델을 미리 받아서 변환해 둠
         run("-c", "import transcribe as t; t.ensure_ko_model()")
+        if apple_silicon:
+            run("-c", "import transcribe as t; ok = t.mlx_available(); print('Apple GPU (MLX):', ok); "
+                      "ok and t.ensure_ko_mlx_model()")
         if args.intel_gpu:
             run("-c", "import transcribe as t; d = t.ov_device(); print('OpenVINO GPU:', d); "
                       "d and t.ensure_ko_ov_model()")

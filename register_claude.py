@@ -57,7 +57,8 @@ def main():
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"등록 완료: {cfg_path}")
 
-    print("\n설치 끝! Claude 데스크톱 앱을 완전히 종료(트레이 아이콘 → 종료)한 뒤 다시 켜고,")
+    quit_hint = "메뉴 막대 Claude → Quit Claude(⌘Q)" if sys.platform == "darwin" else "트레이 아이콘 → 종료"
+    print(f"\n설치 끝! Claude 데스크톱 앱을 완전히 종료({quit_hint})한 뒤 다시 켜고,")
     print("새 채팅에서 '다운로드 폴더에 있는 최근 녹음 요약해줘'라고 말해보세요.")
 
 
