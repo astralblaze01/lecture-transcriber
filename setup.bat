@@ -35,9 +35,6 @@ echo [4/5] 한국어 모델 내려받고 변환 중... (최초 1회, 5~10분)
 echo [5/5] Claude 데스크톱 앱에 등록 중...
 %PY% register_claude.py || goto :fail
 
-echo.
-echo 설치 끝! Claude 데스크톱 앱을 완전히 종료했다가 다시 켠 뒤
-echo "다운로드 폴더에 있는 최근 녹음 요약해줘" 라고 말해보세요.
 pause
 exit /b 0
 
