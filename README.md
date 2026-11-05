@@ -4,7 +4,13 @@
 
 > Local speech-to-text MCP server for the Claude desktop app (Windows). Transcribes lecture recordings on your own machine and lets Claude turn Samsung Notes / PDF slides + recordings into a book-style study guide.
 
-Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 내 PC에서 돌리고 Claude에게는 **텍스트만** 넘기는 구조예요. 녹음 파일은 PC 밖으로 나가지 않아요.
+이 도구는 음성 인식을 PC에서 실행합니다. MCP를 사용하면 Claude에는 받아쓰기 텍스트와 요청한 자료가 전달되며, 녹음 파일은 로컬에서 처리됩니다.
+
+## 모델 직접 선택
+
+`transcribe_menu.bat`을 실행하거나 녹음 파일을 그 위에 끌어다 놓으면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
+
+Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. `large-v3`는 `engine="whisper", model="large-v3"`로 전달됩니다.
 
 ## 기능
 
@@ -12,7 +18,8 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
 - **책 만들기**: 슬라이드 순서를 뼈대로 강의 설명을 풀어 쓴 문서를 `.html`(인쇄용 스타일)과 `.md`로 저장. 강조한 내용은 형광펜, 시험 포인트는 박스로 표시
-- GPU 자동 사용: NVIDIA는 CUDA, 인텔 내장 그래픽(Iris Xe 등)·Arc는 OpenVINO, 없으면 CPU(int8)
+- **GPU 가속** · 지원 모델은 NVIDIA CUDA 또는 Intel OpenVINO로 실행합니다.
+- **반복 인식 완화** · OpenVINO에서 같은 단어나 구절이 길게 반복되면 해당 구간을 재시도하고, 복구하지 못한 구간을 표시합니다.
 
 ## 변환 엔진
 
@@ -21,10 +28,10 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 | 엔진 | 모델 | 실행기 | 노트북 CPU | 이럴 때 |
 |---|---|---|---|---|
 | `ko` (기본) | [batiai/batisay-ko-turbo](https://huggingface.co/batiai/batisay-ko-turbo) — Whisper large-v3-turbo를 한국어로 파인튜닝 | faster-whisper (int8) | 빠름 | 한국어 강의·회의 |
-| `whisper` | OpenAI Whisper (`--model`로 tiny ~ large-v3-turbo 선택) | faster-whisper (int8) | 빠름 | 영어 등 다른 언어, 여러 언어가 섞인 녹음 |
+| `whisper` | OpenAI Whisper (`--model`로 `large-v3`, `large-v3-turbo` 등 선택) | faster-whisper (int8) | 빠름 | 영어 등 다른 언어, 여러 언어가 섞인 녹음 |
 | `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 |
 
-**faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 일반 Whisper와 같은 속도로 한국어 정확도를 더 얻을 수 있어요.
+**faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 한국어 녹음에 맞춘 모델을 사용할 수 있어요.
 
 ### GPU 가속
 
@@ -36,10 +43,15 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 
 자동 순서는 NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. 인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요.
 
-- `ko`, `whisper`는 NVIDIA GPU를 자동으로 써요. `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 함께 설치하니 CUDA Toolkit을 따로 깔 필요는 없어요. GPU 드라이버만 최신이면 돼요. 강제로 CPU를 쓰려면 `--cpu`. 인텔·AMD 그래픽은 지원하지 않아요.
+- Intel GPU에서 `large-v3`를 처음 사용하면 약 3.1GB의 모델을 내려받아 OpenVINO로 변환합니다. 이후에는 저장된 모델을 재사용합니다.
+- 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
 - `ko`, `whisper`는 타임스탬프가 붙고, `cohere`는 타임스탬프 없이 문장 단위로만 나와요.
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
 - 정확도 차이는 녹음 상태에 따라 달라요. 같은 녹음을 엔진별로 돌리면 `녹음.ko.txt`, `녹음.whisper.txt`처럼 따로 저장되니 직접 비교해보세요.
+
+### 변환 시간 예시
+
+Intel Arc 140V에서 Whisper `large-v3`로 강의 녹음 61분 11초를 **7분 8초**에 처리했습니다. 설치를 마친 모델의 로딩 시간은 포함했고, 다운로드와 형식 변환 시간은 제외했습니다. 같은 속도로 환산하면 2시간은 약 14분입니다. 녹음의 언어, 발화 밀도, 장치에 따라 시간이 달라집니다.
 
 ## 설치 (Windows)
 
@@ -66,17 +78,11 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 | `read_pdf_text` | PDF 페이지별 텍스트 |
 | `save_book` | 원고를 `.md` + `.html`로 저장 (처리한 노트 폴더에만 쓰기 허용) |
 
-## 모델 직접 선택
-
-`transcribe_menu.bat`을 실행하거나 녹음 파일을 그 위에 끌어다 놓으면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo 중 하나를 번호로 고를 수 있습니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
-
-Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. `large-v3`는 `engine="whisper", model="large-v3"`로 전달됩니다.
-
 ## 명령줄로 쓰기
 
 ```
 .venv\Scripts\python transcribe.py 녹음.m4a
-.venv\Scripts\python transcribe.py lecture.mp4 --engine whisper --lang en
+.venv\Scripts\python transcribe.py lecture.mp4 --engine whisper --model large-v3 --lang ko --gpu
 ```
 
 ## 구조
@@ -102,5 +108,3 @@ Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) 
 
 - 실제 삼성노트 파일 구조는 버전마다 다를 수 있어요. 녹음/PDF를 못 찾으면 앱에서 직접 내보내서 쓰세요.
 - 그림 위주 슬라이드는 PDF에서 텍스트가 거의 안 나와서, 녹취 위주로 정리돼요.
-
-Intel Arc에서 Whisper large-v3를 쓰려면 Claude MCP에서 engine="whisper", model="large-v3", language="ko"로 요청하세요. 첫 실행 때 모델 다운로드와 OpenVINO 변환이 진행됩니다. 같은 파일을 다른 Whisper 모델로 변환했다면 force=true로 이전 결과 재사용을 건너뛰세요.
