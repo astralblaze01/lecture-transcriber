@@ -1,0 +1,14 @@
+.venv/
+models/
+__pycache__/
+*.pyc
+*.part
+*.ko.txt
+*.whisper.txt
+*.cohere.txt
+*_추출/
+*.sdocx
+*.m4a
+*.mp3
+*.wav
+*.mp4
