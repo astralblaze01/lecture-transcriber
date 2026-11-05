@@ -10,7 +10,6 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 
 - **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe 중 선택 ([변환 엔진](#변환-엔진) 참고)
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
-- **이어하기**: 변환 중 한 줄씩 `.part`에 바로 저장해서, 중간에 꺼도 다음 실행 때 끊긴 지점부터 이어서 변환
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
 - **책 만들기**: 슬라이드 순서를 뼈대로 강의 설명을 풀어 쓴 문서를 `.html`(인쇄용 스타일)과 `.md`로 저장. 강조한 내용은 형광펜, 시험 포인트는 박스로 표시
 - GPU 자동 사용: NVIDIA는 CUDA, 인텔 내장 그래픽(Iris Xe 등)·Arc는 OpenVINO, 없으면 CPU(int8)
@@ -32,7 +31,7 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 | GPU | 방식 | 지원 엔진 | 설치 |
 |---|---|---|---|
 | NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16) | `ko`, `whisper` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
-| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
+| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko`, `whisper`의 `large-v3` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
 | AMD Radeon | 아직 미지원 (CPU로 동작) | — | — |
 
 자동 순서는 NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. 인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요.
@@ -67,6 +66,12 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 | `read_pdf_text` | PDF 페이지별 텍스트 |
 | `save_book` | 원고를 `.md` + `.html`로 저장 (처리한 노트 폴더에만 쓰기 허용) |
 
+## 모델 직접 선택
+
+`transcribe_menu.bat`을 실행하거나 녹음 파일을 그 위에 끌어다 놓으면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo 중 하나를 번호로 고를 수 있습니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
+
+Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. `large-v3`는 `engine="whisper", model="large-v3"`로 전달됩니다.
+
 ## 명령줄로 쓰기
 
 ```
@@ -97,3 +102,5 @@ Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) 
 
 - 실제 삼성노트 파일 구조는 버전마다 다를 수 있어요. 녹음/PDF를 못 찾으면 앱에서 직접 내보내서 쓰세요.
 - 그림 위주 슬라이드는 PDF에서 텍스트가 거의 안 나와서, 녹취 위주로 정리돼요.
+
+Intel Arc에서 Whisper large-v3를 쓰려면 Claude MCP에서 engine="whisper", model="large-v3", language="ko"로 요청하세요. 첫 실행 때 모델 다운로드와 OpenVINO 변환이 진행됩니다. 같은 파일을 다른 Whisper 모델로 변환했다면 force=true로 이전 결과 재사용을 건너뛰세요.

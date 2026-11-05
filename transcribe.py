@@ -182,6 +182,7 @@ def run_ko(audio, gpu=None, on_progress=None, start_at=0.0, **_):
 
 # ---------- 인텔 GPU (OpenVINO) ----------
 KO_OV_DIR = HERE / "models" / "batisay-ko-turbo-ov"
+LARGE_V3_OV_DIR = HERE / "models" / "whisper-large-v3-ov"
 
 
 class _OVStartError(RuntimeError):
@@ -209,21 +210,54 @@ def intel_gpu_available() -> bool:
 
 
 def ensure_ko_ov_model():
-    """한국어 모델을 OpenVINO 형식(fp16)으로 최초 1회 변환."""
-    if (KO_OV_DIR / "openvino_encoder_model.xml").exists():
-        return str(KO_OV_DIR)
-    import subprocess
-    log(f"[최초 1회] {KO_REPO} 를 인텔 GPU(OpenVINO) 형식으로 변환합니다 (몇 분 걸림)...")
-    KO_OV_DIR.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
-           "--model", KO_REPO, "--task", "automatic-speech-recognition-with-past",
-           "--weight-format", "fp16", str(KO_OV_DIR)]
-    r = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
-    if r.returncode != 0 or not (KO_OV_DIR / "openvino_encoder_model.xml").exists():
-        raise _OVStartError("OpenVINO 변환 실패 (setup.bat을 다시 실행하거나 --cpu로 쓰세요)")
-    log(f"변환 완료: {KO_OV_DIR}")
-    return str(KO_OV_DIR)
+    return _ensure_ov_model(KO_REPO, KO_OV_DIR)
 
+
+def _ensure_ov_tokenizers(model_dir: Path) -> None:
+    names = ("openvino_tokenizer", "openvino_detokenizer")
+    if all((model_dir / (name + ext)).is_file()
+           for name in names for ext in (".xml", ".bin")):
+        return
+    try:
+        import openvino as ov
+        from openvino_tokenizers import convert_tokenizer
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
+        models = convert_tokenizer(tokenizer, with_detokenizer=True)
+        for name, model in zip(names, models, strict=True):
+            ov.save_model(model, model_dir / (name + ".xml"))
+    except Exception as exc:
+        raise _OVStartError(f"OpenVINO 토크나이저 변환 실패: {exc}") from exc
+
+
+def _ensure_ov_model(repo: str, model_dir: Path) -> str:
+    """Export once, then publish only the completed OpenVINO model."""
+    import subprocess
+    import tempfile
+
+    with _models_lock:
+        if (model_dir / "openvino_encoder_model.xml").is_file():
+            _ensure_ov_tokenizers(model_dir)
+            return str(model_dir)
+        log(f"[최초 1회] {repo} 를 인텔 GPU(OpenVINO) 형식으로 변환합니다.")
+        model_dir.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=model_dir.parent) as temp:
+            staging = Path(temp) / "model"
+            cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
+                   "--model", repo, "--task", "automatic-speech-recognition-with-past",
+                   "--weight-format", "fp16", str(staging)]
+            result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+            if result.returncode != 0 or not (staging / "openvino_encoder_model.xml").is_file():
+                raise _OVStartError(f"{repo} OpenVINO 변환 실패")
+            _ensure_ov_tokenizers(staging)
+            try:
+                staging.rename(model_dir)
+            except FileExistsError:
+                if not (model_dir / "openvino_encoder_model.xml").is_file():
+                    raise _OVStartError(f"완료되지 않은 모델 폴더가 있습니다: {model_dir}")
+        log(f"변환 완료: {model_dir}")
+        return str(model_dir)
 
 def _cut_points(wav, sr, target_s=300):
     """긴 녹음을 약 target_s초 단위로 자르되, 말하는 중간이 아니라 조용한 틈에서 자름."""
@@ -244,6 +278,47 @@ def _cut_points(wav, sr, target_s=300):
         t = c + target_s
     cuts.append(total)
     return cuts
+
+
+_REPEATED_PHRASE = re.compile(
+    r"(?<!\S)(\S+(?:\s+\S+){0,5}?)(?:\s+\1){5,}(?=\s|$)"
+)
+
+
+def _has_transcription_loop(text: str) -> bool:
+    # 짧은 숫자열(예: 비트 스터핑 예제)과 일반적인 반복은 유지한다.
+    return any(len(match[0]) >= 35 for match in _REPEATED_PHRASE.finditer(text))
+
+
+def _openvino_rows(pipe, audio, lang):
+    result = pipe.generate(audio.tolist(), language=f"<|{lang}|>", task="transcribe",
+                           return_timestamps=True)
+    chunks = result.chunks or []
+    if chunks and isinstance(chunks[0], (list, tuple)):
+        chunks = chunks[0]
+    if chunks:
+        return [(max(chunk.start_ts, 0.0), chunk.text.strip()) for chunk in chunks]
+    text = (result.texts[0] if getattr(result, "texts", None) else str(result)).strip()
+    return [(0.0, text)] if text else []
+
+
+def _retry_openvino_loops(pipe, piece, sr, lang, rows):
+    for index, (offset, text) in enumerate(rows):
+        if not text:
+            continue
+        if _has_transcription_loop(text):
+            next_offset = rows[index + 1][0] if index + 1 < len(rows) else len(piece) / sr
+            end = min(len(piece) / sr, max(offset + 2.0, next_offset), offset + 25.0)
+            clip = piece[int(offset * sr):int(end * sr)]
+            if len(clip):
+                try:
+                    text = " ".join(retry for _, retry in _openvino_rows(pipe, clip, lang)).strip()
+                except RuntimeError as exc:
+                    log(f"반복 인식 구간 재시도 실패: {exc}")
+                    text = ""
+            if not len(clip) or not text or _has_transcription_loop(text):
+                text = "[반복 인식 오류 · 재변환으로 복구하지 못함]"
+        yield offset, text
 
 
 def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None, start_at=0.0):
@@ -267,20 +342,21 @@ def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None, sta
     total = full
     for a, b in zip(cuts, cuts[1:]):
         piece = wav[int(a * sr):int(b * sr)]
-        res = pipe.generate(piece.tolist(), language=f"<|{lang}|>", task="transcribe",
-                            return_timestamps=True)
-        chunks = res.chunks[0] if res.chunks and isinstance(res.chunks[0], (list, tuple)) else (res.chunks or [])
-        if chunks:
-            for ch in chunks:
-                text = ch.text.strip()
-                if text:
-                    yield start_at + a + max(ch.start_ts, 0.0), text
-        else:
-            text = (res.texts[0] if getattr(res, "texts", None) else str(res)).strip()
-            if text:
-                yield start_at + a, text
+        rows = _openvino_rows(pipe, piece, lang)
+        for offset, text in _retry_openvino_loops(pipe, piece, sr, lang, rows):
+            yield start_at + a + offset, text
         if on_progress and total:
             on_progress(min((start_at + b) / total, 1.0))
+
+
+def _run_large_v3_openvino(audio, lang, gpu, on_progress, start_at):
+    try:
+        model_dir = _ensure_ov_model("openai/whisper-large-v3", LARGE_V3_OV_DIR)
+        yield from run_openvino(audio, model_dir, lang, on_progress=on_progress, start_at=start_at)
+        return
+    except _OVStartError as exc:
+        log(f"large-v3 인텔 GPU 시작 실패, CPU로 전환: {exc}")
+    yield from run_whisper(audio, lang, "large-v3", gpu, on_progress, start_at)
 
 
 def run_cohere(audio, lang="ko", on_progress=None, **_):
@@ -327,14 +403,17 @@ def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, 
     if engine == "ko":
         return run_ko(audio, gpu=gpu, on_progress=on_progress, start_at=start_at)
     if engine == "whisper":
+        if model == "large-v3" and gpu is not False and not cuda_available() and intel_gpu_available():
+            return _run_large_v3_openvino(audio, lang, gpu, on_progress, start_at)
         return run_whisper(audio, lang, model, gpu, on_progress, start_at)
     if engine == "cohere":
         return run_cohere(audio, lang, on_progress=on_progress)
     raise ValueError(f"알 수 없는 엔진: {engine} (가능: {', '.join(ENGINES)})")
 
 
-def output_path(audio, engine) -> Path:
-    return Path(audio).with_suffix(f".{engine}.txt")
+def output_path(audio, engine, model="large-v3-turbo") -> Path:
+    suffix = ".whisper.large-v3.txt" if engine == "whisper" and model == "large-v3" else f".{engine}.txt"
+    return Path(audio).with_suffix(suffix)
 
 
 def format_line(start, text) -> str:
@@ -361,14 +440,14 @@ def _resume_point(part: Path):
 
 
 def transcribe_to_file(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None,
-                       on_progress=None, echo=False) -> Path:
+                       on_progress=None, echo=False, *, force=False) -> Path:
     """녹음을 <이름>.<engine>.txt로 변환. 중간에 끊겨도 다음 실행 때 끊긴 지점부터 이어서 함.
     변환 중에는 <이름>.<engine>.txt.part에 한 줄씩 바로 저장하고, 끝까지 성공하면 이름을 바꿈."""
-    out = output_path(audio, engine)
-    if out.exists():
+    out = output_path(audio, engine, model)
+    if out.exists() and not force:
         return out
     part = out.with_suffix(out.suffix + ".part")
-    start_at = _resume_point(part) if engine != "cohere" else 0.0  # cohere는 타임스탬프가 없어 처음부터
+    start_at = _resume_point(part) if not force and engine != "cohere" else 0.0  # cohere는 타임스탬프가 없어 처음부터
     if start_at:
         log(f"이어서 변환: {fmt(start_at)}부터")
     with part.open("a" if start_at else "w", encoding="utf-8") as f:
@@ -384,26 +463,40 @@ def transcribe_to_file(audio, engine="ko", lang="ko", model="large-v3-turbo", gp
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("audio", help="mp3, m4a, wav, mp4 등")
+    p.add_argument("audio", nargs="?", help="mp3, m4a, wav, mp4 등")
     p.add_argument("--engine", choices=ENGINES, default="ko")
     p.add_argument("--model", default="large-v3-turbo",
-                   help="whisper 엔진 전용: tiny/base/small/medium/large-v3-turbo")
+                   help="whisper 엔진 전용: tiny/base/small/medium/large-v3/large-v3-turbo")
     p.add_argument("--lang", default="ko")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--gpu", dest="gpu", action="store_const", const=True,
-                   help="NVIDIA GPU 강제 사용 (기본: 있으면 자동으로 GPU)")
+                   help="GPU 사용 (NVIDIA CUDA, 지원 모델은 Intel OpenVINO)")
     g.add_argument("--cpu", dest="gpu", action="store_const", const=False, help="CPU 강제 사용")
     p.add_argument("--force", action="store_true", help="이미 변환된 결과가 있어도 처음부터 다시")
+    p.add_argument("--choose-model", action="store_true", help="녹음과 음성 인식 모델을 직접 선택")
     p.set_defaults(gpu=None)
     a = p.parse_args()
 
-    out = output_path(a.audio, a.engine)
-    if out.exists() and a.force:
-        out.unlink()
-    if out.exists():
+    if a.choose_model:
+        if a.audio is None:
+            a.audio = input("녹음 파일 경로를 붙여넣으세요: ").strip().strip('"')
+        choices = {
+            "1": ("ko", "large-v3-turbo"),
+            "2": ("whisper", "large-v3"),
+            "3": ("whisper", "large-v3-turbo"),
+        }
+        print("1. 한국어 특화 BatiSay Turbo\n2. Whisper large-v3 (Intel GPU 지원)\n3. Whisper large-v3-turbo")
+        choice = input("모델 번호 [1]: ").strip() or "1"
+        if choice not in choices:
+            p.error("모델 번호는 1, 2, 3 중 하나여야 합니다.")
+        a.engine, a.model = choices[choice]
+    if not a.audio or not Path(a.audio).is_file():
+        p.error("존재하는 녹음 파일 경로를 입력하세요.")
+    out = output_path(a.audio, a.engine, a.model)
+    if out.exists() and not a.force:
         print(f"이미 변환돼 있어요: {out}  (다시 하려면 --force)")
         return
-    out = transcribe_to_file(a.audio, a.engine, a.lang, a.model, a.gpu, echo=True)
+    out = transcribe_to_file(a.audio, a.engine, a.lang, a.model, a.gpu, echo=True, force=a.force)
     print(f"\n저장 완료: {out}")
 
 

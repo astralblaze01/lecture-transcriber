@@ -76,7 +76,7 @@ def _worker():
 
             # 중간에 끊긴 .part가 있으면 그 지점부터 이어서 함. 실패해도 .part는 남겨 다음에 이어감.
             out = tr.transcribe_to_file(job["file"], job["engine"], job["language"],
-                                        job["model"], job["gpu"], on_progress)
+                                        job["model"], job["gpu"], on_progress, force=job["force"])
             job.update(status="done", progress=1.0, output=str(out), finished=time.time())
         except Exception as e:  # noqa: BLE001
             job.update(status="error", error=f"{type(e).__name__}: {e} (다시 시작하면 끊긴 지점부터 이어서 해요)",
@@ -192,6 +192,8 @@ def find_recordings(folder: str = "", limit: int = 15) -> str:
         st = f.stat()
         dur = _duration(f) if f.suffix.lower() in AUDIO_EXTS else None
         done = [e for e in tr.ENGINES if tr.output_path(f, e).exists()]
+        if tr.output_path(f, "whisper", "large-v3").exists():
+            done.append("whisper:large-v3")
         lines.append(
             f"- {f}\n  수정: {datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M}, "
             f"크기: {st.st_size / 1e6:.1f}MB" + (f", 길이: {tr.fmt(dur)}" if dur else "")
@@ -206,7 +208,7 @@ def start_transcription(file_path: str, engine: str = "ko", language: str = "ko"
                         force: bool = False) -> str:
     """녹음 파일을 텍스트로 변환하는 작업을 시작하고 job_id를 돌려줍니다.
     engine: 'ko'(한국어 특화, 기본) | 'whisper'(다국어, model로 크기 선택) | 'cohere'(GPU 권장)
-    gpu: 비우면 NVIDIA GPU가 있을 때 자동 사용, false면 CPU 강제.
+    gpu: 비우면 지원 GPU 자동 사용, false면 CPU 강제. Intel GPU는 ko와 whisper large-v3 지원.
     language: 'ko', 'en' 등. 이미 변환한 파일은 force=false면 저장된 결과를 바로 씁니다."""
     path = _clean_path(file_path)
     if not path.is_file():
@@ -216,10 +218,10 @@ def start_transcription(file_path: str, engine: str = "ko", language: str = "ko"
 
     jid = uuid.uuid4().hex[:8]
     job = dict(id=jid, file=str(path), engine=engine, language=language,
-               model=model, gpu=gpu, status="queued", progress=0.0)
+               model=model, gpu=gpu, force=force, status="queued", progress=0.0)
     jobs[jid] = job
 
-    out = tr.output_path(path, engine)
+    out = tr.output_path(path, engine, model)
     if out.exists() and not force:
         job.update(status="done", progress=1.0, output=str(out), cached=True,
                    started=time.time(), finished=time.time())
@@ -228,6 +230,7 @@ def start_transcription(file_path: str, engine: str = "ko", language: str = "ko"
     # 같은 파일·엔진이 이미 돌고 있으면 그 작업을 알려줌
     for other in jobs.values():
         if (other is not job and other["file"] == job["file"] and other["engine"] == engine
+                and tr.output_path(path, engine, other["model"]) == out
                 and other["status"] in ("queued", "running")):
             del jobs[jid]
             return f"이미 진행 중인 작업이 있어요. job_id: {other['id']}"
@@ -262,7 +265,9 @@ def _remember_dir(d: Path):
 
 
 @mcp.tool()
-def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko") -> str:
+def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko",
+                         model: str = "large-v3-turbo", gpu: bool | None = None,
+                         force: bool = False) -> str:
     """강의 노트를 책으로 만들기 위한 준비를 한 번에 합니다.
     .sdocx(삼성노트)면 압축을 풀어 녹음과 PDF를 꺼내고, 녹음 변환 작업을 바로 시작합니다.
     .pdf면 같은 폴더에서 이름이 비슷한 녹음을 찾아 변환을 시작합니다.
@@ -303,7 +308,7 @@ def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko
     if not audios:
         lines.append("녹음: 없음 — 노트에 녹음이 안 들어있어요. 사용자에게 녹음 파일 위치를 물어보세요.")
     for a in audios:
-        res = start_transcription(str(a), engine=engine, language=language)
+        res = start_transcription(str(a), engine=engine, language=language, model=model, gpu=gpu, force=force)
         jid = re.search(r"job_id: (\w+)", res)
         dur = _duration(a)
         lines.append(f"녹음: {a}  (길이 {tr.fmt(dur) if dur else '?'})  → "
