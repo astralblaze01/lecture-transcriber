@@ -29,6 +29,12 @@ echo [2/5] 패키지 설치 중... (몇 분 걸려요)
 echo [3/5] PyTorch(CPU) 설치 중... (한국어 모델 변환에만 쓰여요)
 %PY% -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu || goto :fail
 
+where nvidia-smi >nul 2>nul
+if not errorlevel 1 (
+  echo [GPU] NVIDIA GPU found - installing CUDA libraries...
+  %PY% -m pip install -q nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10" || echo [GPU] install failed - continuing with CPU.
+)
+
 echo [4/5] 한국어 모델 내려받고 변환 중... (최초 1회, 5~10분)
 %PY% -c "import transcribe; transcribe.ensure_ko_model()" || goto :fail
 

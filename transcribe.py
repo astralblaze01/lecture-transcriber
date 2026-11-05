@@ -11,6 +11,7 @@
   python transcribe.py 녹음.m4a                       # ko 엔진
   python transcribe.py 녹음.m4a --engine whisper --model large-v3-turbo --lang en
   python transcribe.py 녹음.m4a --engine cohere
+  (NVIDIA GPU가 있으면 자동으로 GPU 사용, --cpu로 끌 수 있음)
 결과
   녹음.<engine>.txt 가 같은 폴더에 생성
 
@@ -48,16 +49,61 @@ _models = {}
 _models_lock = threading.Lock()
 
 
-def _whisper_model(name_or_path, gpu):
+def _add_cuda_dll_dirs():
+    """pip로 설치한 NVIDIA 라이브러리(cuBLAS, cuDNN)를 Windows가 찾을 수 있게 경로 등록.
+    CUDA Toolkit을 따로 설치하지 않아도 GPU를 쓸 수 있게 하려는 것."""
+    try:
+        import nvidia  # nvidia-cublas-cu12 / nvidia-cudnn-cu12 패키지
+    except ImportError:
+        return
+    for base in getattr(nvidia, "__path__", []):
+        for sub in Path(base).glob("*/bin"):
+            try:
+                os.add_dll_directory(str(sub))
+            except (AttributeError, OSError):
+                pass
+            os.environ["PATH"] = str(sub) + os.pathsep + os.environ.get("PATH", "")
+
+
+def cuda_available() -> bool:
+    _add_cuda_dll_dirs()
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_device(gpu):
+    """gpu: True=GPU 강제, False=CPU 강제, None=자동(있으면 GPU)."""
+    if gpu is False:
+        return "cpu"
+    if cuda_available():
+        return "cuda"
+    if gpu:
+        log("경고: GPU를 요청했지만 CUDA를 쓸 수 없어 CPU로 진행해요.")
+    return "cpu"
+
+
+def _whisper_model(name_or_path, gpu=None):
     from faster_whisper import WhisperModel
 
-    key = ("fw", name_or_path, gpu)
+    device = _resolve_device(gpu)
+    key = ("fw", name_or_path, device)
     with _models_lock:
         if key not in _models:
-            device, ctype = ("cuda", "float16") if gpu else ("cpu", "int8")
             log(f"모델 로드 중: {name_or_path} ({device})")
+            if device == "cuda":
+                try:
+                    _models[key] = WhisperModel(name_or_path, device="cuda", compute_type="float16")
+                    return _models[key]
+                except Exception as e:  # noqa: BLE001  (드라이버·cuDNN 문제 등)
+                    log(f"GPU로 모델을 올리지 못해 CPU로 바꿔요: {type(e).__name__}: {e}")
+                    key = ("fw", name_or_path, "cpu")
+                    if key in _models:
+                        return _models[key]
             _models[key] = WhisperModel(
-                name_or_path, device=device, compute_type=ctype,
+                name_or_path, device="cpu", compute_type="int8",
                 cpu_threads=os.cpu_count() or 4,  # CPU 코어 전부 사용
             )
         return _models[key]
@@ -98,7 +144,7 @@ def ensure_ko_model():
 # 모든 엔진은 (시작초 또는 None, 텍스트)를 yield 하고,
 # on_progress(0~1)를 받으면 진행률을 알려줌.
 
-def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=False, on_progress=None):
+def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=None, on_progress=None):
     m = _whisper_model(model, gpu)
     segments, info = m.transcribe(audio, language=lang, vad_filter=True)
     total = info.duration or 0
@@ -108,7 +154,7 @@ def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=False, on_progress
         yield seg.start, seg.text.strip()
 
 
-def run_ko(audio, gpu=False, on_progress=None, **_):
+def run_ko(audio, gpu=None, on_progress=None, **_):
     yield from run_whisper(audio, "ko", ensure_ko_model(), gpu, on_progress)
 
 
@@ -150,7 +196,7 @@ def run_cohere(audio, lang="ko", on_progress=None, **_):
             yield None, sent.strip()
 
 
-def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=False, on_progress=None):
+def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, on_progress=None):
     """엔진을 골라 (시작초, 텍스트)를 차례로 돌려줌."""
     if engine == "ko":
         return run_ko(audio, gpu=gpu, on_progress=on_progress)
@@ -176,7 +222,11 @@ def main():
     p.add_argument("--model", default="large-v3-turbo",
                    help="whisper 엔진 전용: tiny/base/small/medium/large-v3-turbo")
     p.add_argument("--lang", default="ko")
-    p.add_argument("--gpu", action="store_true", help="NVIDIA GPU가 있으면 사용")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--gpu", dest="gpu", action="store_const", const=True,
+                   help="NVIDIA GPU 강제 사용 (기본: 있으면 자동으로 GPU)")
+    g.add_argument("--cpu", dest="gpu", action="store_const", const=False, help="CPU 강제 사용")
+    p.set_defaults(gpu=None)
     a = p.parse_args()
 
     out = output_path(a.audio, a.engine)
