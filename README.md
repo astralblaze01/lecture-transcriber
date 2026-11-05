@@ -12,7 +12,7 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
 - **책 만들기**: 슬라이드 순서를 뼈대로 강의 설명을 풀어 쓴 문서를 `.html`(인쇄용 스타일)과 `.md`로 저장. 강조한 내용은 형광펜, 시험 포인트는 박스로 표시
-- NVIDIA GPU가 있으면 자동으로 GPU(float16), 없으면 CPU(int8)로 동작 — GPU면 보통 5~20배 빠름
+- GPU 자동 사용: NVIDIA는 CUDA, 인텔 내장 그래픽(Iris Xe 등)·Arc는 OpenVINO, 없으면 CPU(int8)
 
 ## 변환 엔진
 
@@ -25,6 +25,16 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 | `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 |
 
 **faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 일반 Whisper와 같은 속도로 한국어 정확도를 더 얻을 수 있어요.
+
+### GPU 가속
+
+| GPU | 방식 | 지원 엔진 | 설치 |
+|---|---|---|---|
+| NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16) | `ko`, `whisper` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
+| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
+| AMD Radeon | 아직 미지원 (CPU로 동작) | — | — |
+
+자동 순서는 NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. 인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요.
 
 - `ko`, `whisper`는 NVIDIA GPU를 자동으로 써요. `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 함께 설치하니 CUDA Toolkit을 따로 깔 필요는 없어요. GPU 드라이버만 최신이면 돼요. 강제로 CPU를 쓰려면 `--cpu`. 인텔·AMD 그래픽은 지원하지 않아요.
 - `ko`, `whisper`는 타임스탬프가 붙고, `cohere`는 타임스탬프 없이 문장 단위로만 나와요.

@@ -11,7 +11,7 @@
   python transcribe.py 녹음.m4a                       # ko 엔진
   python transcribe.py 녹음.m4a --engine whisper --model large-v3-turbo --lang en
   python transcribe.py 녹음.m4a --engine cohere
-  (NVIDIA GPU가 있으면 자동으로 GPU 사용, --cpu로 끌 수 있음)
+  (GPU 자동 사용: NVIDIA → CUDA, 인텔 내장/Arc → OpenVINO(ko 엔진), 없으면 CPU. --cpu로 끌 수 있음)
 결과
   녹음.<engine>.txt 가 같은 폴더에 생성
 
@@ -155,7 +155,117 @@ def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=None, on_progress=
 
 
 def run_ko(audio, gpu=None, on_progress=None, **_):
+    # 자동 모드: NVIDIA(CUDA) → 인텔 GPU(OpenVINO) → CPU 순서
+    if gpu is not False and not cuda_available() and intel_gpu_available():
+        try:
+            yield from run_openvino(audio, ensure_ko_ov_model(), "ko", on_progress=on_progress)
+            return
+        except _OVStartError as e:
+            log(f"인텔 GPU로 시작하지 못해 CPU로 바꿔요: {e}")
     yield from run_whisper(audio, "ko", ensure_ko_model(), gpu, on_progress)
+
+
+# ---------- 인텔 GPU (OpenVINO) ----------
+KO_OV_DIR = HERE / "models" / "batisay-ko-turbo-ov"
+
+
+class _OVStartError(RuntimeError):
+    """OpenVINO로 시작조차 못 했을 때(설치·변환·장치 문제). 이미 텍스트를 내보낸 뒤의 오류와 구분."""
+
+
+def ov_device():
+    """OpenVINO가 쓸 수 있는 인텔 GPU 이름 ('GPU' 또는 'GPU.0'), 없으면 None. AMD·NVIDIA는 여기 안 잡힘."""
+    try:
+        import openvino as ov
+        devs = ov.Core().available_devices
+    except Exception:  # noqa: BLE001
+        return None
+    gpus = [d for d in devs if d.startswith("GPU")]
+    if not gpus:
+        return None
+    # 내장+외장이 같이 있으면 GPU.1이 보통 외장(Arc)
+    return sorted(gpus)[-1] if len(gpus) > 1 else gpus[0]
+
+
+def intel_gpu_available() -> bool:
+    if os.environ.get("TRANSCRIBE_NO_OPENVINO"):
+        return False
+    return ov_device() is not None
+
+
+def ensure_ko_ov_model():
+    """한국어 모델을 OpenVINO 형식(fp16)으로 최초 1회 변환."""
+    if (KO_OV_DIR / "openvino_encoder_model.xml").exists():
+        return str(KO_OV_DIR)
+    import subprocess
+    log(f"[최초 1회] {KO_REPO} 를 인텔 GPU(OpenVINO) 형식으로 변환합니다 (몇 분 걸림)...")
+    KO_OV_DIR.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
+           "--model", KO_REPO, "--task", "automatic-speech-recognition-with-past",
+           "--weight-format", "fp16", str(KO_OV_DIR)]
+    r = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    if r.returncode != 0 or not (KO_OV_DIR / "openvino_encoder_model.xml").exists():
+        raise _OVStartError("OpenVINO 변환 실패 (setup.bat을 다시 실행하거나 --cpu로 쓰세요)")
+    log(f"변환 완료: {KO_OV_DIR}")
+    return str(KO_OV_DIR)
+
+
+def _cut_points(wav, sr, target_s=300):
+    """긴 녹음을 약 target_s초 단위로 자르되, 말하는 중간이 아니라 조용한 틈에서 자름."""
+    total = len(wav) / sr
+    if total <= target_s * 1.2:
+        return [0.0, total]
+    try:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        speech = get_speech_timestamps(wav, VadOptions(min_silence_duration_ms=300))
+        gaps = [(a["end"] + b["start"]) / 2 / sr for a, b in zip(speech, speech[1:])]
+    except Exception:  # noqa: BLE001
+        gaps = []
+    cuts, t = [0.0], target_s
+    while t < total - target_s * 0.2:
+        near = [g for g in gaps if abs(g - t) < 30 and g > cuts[-1] + 30]
+        c = min(near, key=lambda g: abs(g - t)) if near else t
+        cuts.append(c)
+        t = c + target_s
+    cuts.append(total)
+    return cuts
+
+
+def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None):
+    try:
+        import openvino_genai as ovg
+        from faster_whisper.audio import decode_audio
+        device = device or ov_device() or "CPU"
+        key = ("ov", model_dir, device)
+        with _models_lock:
+            if key not in _models:
+                log(f"모델 로드 중: {model_dir} (OpenVINO {device})")
+                Pipe = getattr(ovg, "ASRPipeline", None) or ovg.WhisperPipeline
+                _models[key] = Pipe(model_dir, device)
+        pipe = _models[key]
+        sr = 16000
+        wav = decode_audio(audio, sampling_rate=sr)
+    except Exception as e:  # noqa: BLE001
+        raise _OVStartError(f"{type(e).__name__}: {e}") from e
+
+    cuts = _cut_points(wav, sr)
+    total = cuts[-1]
+    for a, b in zip(cuts, cuts[1:]):
+        piece = wav[int(a * sr):int(b * sr)]
+        res = pipe.generate(piece.tolist(), language=f"<|{lang}|>", task="transcribe",
+                            return_timestamps=True)
+        chunks = res.chunks[0] if res.chunks and isinstance(res.chunks[0], (list, tuple)) else (res.chunks or [])
+        if chunks:
+            for ch in chunks:
+                text = ch.text.strip()
+                if text:
+                    yield a + max(ch.start_ts, 0.0), text
+        else:
+            text = (res.texts[0] if getattr(res, "texts", None) else str(res)).strip()
+            if text:
+                yield a, text
+        if on_progress and total:
+            on_progress(min(b / total, 1.0))
 
 
 def run_cohere(audio, lang="ko", on_progress=None, **_):

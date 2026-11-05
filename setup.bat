@@ -35,6 +35,13 @@ if not errorlevel 1 (
   %PY% -m pip install -q nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10" || echo [GPU] install failed - continuing with CPU.
 )
 
+powershell -NoProfile -Command "if ((Get-CimInstance Win32_VideoController).Name -match 'Intel') { exit 0 } else { exit 1 }" >nul 2>nul
+if not errorlevel 1 (
+  echo [GPU] Intel GPU found - installing OpenVINO...
+  %PY% -m pip install -q torchvision --index-url https://download.pytorch.org/whl/cpu
+  %PY% -m pip install -q openvino-genai "optimum-intel[openvino]" "transformers>=4.51,<5" && %PY% -c "import transcribe as t; d=t.ov_device(); print('[GPU] OpenVINO device:', d); d and t.ensure_ko_ov_model()" || echo [GPU] OpenVINO setup failed - continuing with CPU.
+)
+
 echo [4/5] 한국어 모델 내려받고 변환 중... (최초 1회, 5~10분)
 %PY% -c "import transcribe; transcribe.ensure_ko_model()" || goto :fail
 
