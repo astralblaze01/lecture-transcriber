@@ -14,8 +14,8 @@ def sniff(head: bytes):
     """확장자 대신 파일 앞부분(시그니처)으로 종류 판별. 삼성노트는 내부 파일 이름이 제각각이라서."""
     if head.startswith(b"%PDF"):
         return PDF, ".pdf"
-    if head[4:8] == b"ftyp":  # m4a, mp4, 3gp 등
-        return AUDIO, ".m4a" if head[8:11] in (b"M4A", b"M4B") else ".mp4"
+    if head[4:8] == b"ftyp":  # m4a, mp4, 3gp 등 (삼성노트 녹음은 3gp4 브랜드의 m4a)
+        return AUDIO, ".mp4" if head[8:12] in (b"mp41", b"mp42", b"isom", b"qt  ") else ".m4a"
     if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
         return AUDIO, ".mp3"
     if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
@@ -62,7 +62,18 @@ def extract_note(note: Path) -> dict:
                     while chunk := src.read(1 << 20):
                         dst.write(chunk)
             found[kind].append(target)
+    # 노트 안 파일 이름 순서는 녹음 순서와 달라서, 녹음 시각 순으로 정렬
+    found[AUDIO].sort(key=_recorded_at)
     return {"dir": out_dir, "audio": found[AUDIO], "pdf": found[PDF], "images": found[IMAGE]}
+
+
+def _recorded_at(path: Path) -> str:
+    try:
+        import av  # faster-whisper와 함께 설치됨
+        with av.open(str(path)) as c:
+            return c.metadata.get("creation_time", "") or path.name
+    except Exception:  # noqa: BLE001
+        return path.name
 
 
 def _parse_pages(spec: str, n: int):
