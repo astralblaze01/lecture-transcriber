@@ -107,8 +107,8 @@ def pdf_text(pdf: Path, pages: str = "") -> tuple[int, str]:
 
 
 BOOK_CSS = """
-:root{--ink:#222;--muted:#666;--line:#e3ddd2;--paper:#fffdf8;--mark:#fff1a8;--key-bg:#fff4e5;--key:#c2410c}
-@media (prefers-color-scheme:dark){:root{--ink:#e8e4dc;--muted:#a8a29a;--line:#3a3631;--paper:#1c1a17;--mark:#5c4d0f;--key-bg:#3a2a18;--key:#fb923c}}
+:root{--ink:#222;--muted:#666;--line:#e3ddd2;--paper:#fffdf8;--mark:#fff1a8;--key-bg:#fff4e5;--key:#c2410c;--note-bg:#f1f4f8;--note:#64748b}
+@media (prefers-color-scheme:dark){:root{--ink:#e8e4dc;--muted:#a8a29a;--line:#3a3631;--paper:#1c1a17;--mark:#5c4d0f;--key-bg:#3a2a18;--key:#fb923c;--note-bg:#252a31;--note:#94a3b8}}
 body{background:var(--paper);color:var(--ink);font-family:"Noto Serif KR","Nanum Myeongjo",Batang,serif;
   line-height:1.85;font-size:17px;max-width:760px;margin:0 auto;padding:48px 20px 96px;word-break:keep-all}
 h1{font-size:2em;line-height:1.3;margin:0 0 .3em}
@@ -117,28 +117,79 @@ h3{font-size:1.15em;margin:1.8em 0 .4em}
 h1,h2,h3{font-family:"Pretendard","Malgun Gothic",sans-serif}
 mark{background:var(--mark);color:inherit;padding:0 .15em;border-radius:3px}
 strong{color:var(--key)}
-blockquote{margin:1.4em 0;padding:.9em 1.1em;background:var(--key-bg);border-left:4px solid var(--key);border-radius:0}
+blockquote{margin:1.4em 0;padding:.9em 1.1em;background:var(--note-bg);border-left:4px solid var(--note);border-radius:0}
+blockquote.exam{background:var(--key-bg);border-left-color:var(--key)}
 blockquote p{margin:.3em 0}
+.math.display{overflow-x:auto;overflow-y:hidden;margin:1em 0;text-align:center}
+td .math.display,th .math.display{margin:0;text-align:left}
 code{font-family:Consolas,monospace;font-size:.9em;background:var(--line);padding:.1em .3em;border-radius:3px}
 pre{background:var(--line);padding:1em;overflow-x:auto;border-radius:6px}
 pre code{background:none;padding:0}
 table{border-collapse:collapse;margin:1.2em 0;width:100%}
 th,td{border:1px solid var(--line);padding:.45em .7em;text-align:left}
 .src{color:var(--muted);font-size:.8em;font-family:"Pretendard","Malgun Gothic",sans-serif}
-@media print{body{max-width:none;padding:0;font-size:11pt;background:#fff;color:#000}h2{break-before:page}
-  mark{background:#fff1a8}blockquote{background:#fff4e5}}
+@media print{body{max-width:none;padding:0;font-size:11pt;background:#fff;color:#000}
+  mark{background:#fff1a8}blockquote{background:#f1f4f8}blockquote.exam{background:#fff4e5}
+  h2,h3{break-after:avoid}table,blockquote,pre,.math.display{break-inside:avoid}}
 """
 
 
+KATEX_CDN = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+_MATH_DISPLAY = re.compile(r"\$\$(.+?)\$\$", re.S)
+_MATH_INLINE = re.compile(r"(?<![\\$])\$(?![\s$])([^$\n]+?)(?<!\s)\$(?!\d)")
+
+
 def markdown_to_book_html(md_text: str, title: str) -> str:
+    """책 원고(마크다운)를 인쇄용 HTML로. '==텍스트=='는 형광펜, $...$/$$...$$는 KaTeX 수식,
+    '> **시험 포인트** ...' 인용은 주황 박스, 그 밖의 인용은 회색 메모 박스로 표시."""
     import markdown
 
-    # ==강조== → <mark>, 코드 블록 안은 건드리지 않음
-    parts = re.split(r"(```.*?```|`[^`]*`)", md_text, flags=re.S)
-    for i in range(0, len(parts), 2):
-        parts[i] = re.sub(r"==(.+?)==", r"<mark>\1</mark>", parts[i])
-    body = markdown.markdown("".join(parts), extensions=["tables", "fenced_code", "sane_lists"])
+    # 코드 → 수식 순서로 보호한 뒤 마크다운 변환 (수식 안의 _ * \\ 가 망가지지 않게)
+    saved = []
+
+    def keep(kind):
+        def _f(m):
+            saved.append((kind, m.group(1) if kind != "code" else m.group(0)))
+            return f"KEEPTOKEN{len(saved) - 1}END"
+        return _f
+
+    text = re.sub(r"```.*?```|`[^`]*`", keep("code"), md_text, flags=re.S)
+    text = _MATH_DISPLAY.sub(keep("display"), text)
+    text = _MATH_INLINE.sub(keep("inline"), text)
+    text = re.sub(r"==(.+?)==", r"<mark>\1</mark>", text)
+    # Python-Markdown은 문단 바로 다음 줄의 목록을 목록으로 안 봐서, 그 앞에 빈 줄을 넣어 줌
+    lines, fixed = text.split("\n"), []
+    for ln in lines:
+        is_item = re.match(r"\s*(?:[-*+]|\d+\.)\s", ln)
+        prev = fixed[-1] if fixed else ""
+        if is_item and prev.strip() and not re.match(r"\s*(?:[-*+]|\d+\.)\s", prev) \
+                and not prev.lstrip().startswith(("|", ">")) and not ln.startswith((" ", "\t")):
+            fixed.append("")
+        fixed.append(ln)
+    text = "\n".join(fixed)
+
+    def restore_code(t):
+        return re.sub(r"KEEPTOKEN(\d+)END",
+                      lambda m: saved[int(m.group(1))][1] if saved[int(m.group(1))][0] == "code" else m.group(0), t)
+
+    body = markdown.markdown(restore_code(text), extensions=["tables", "fenced_code", "sane_lists"])
+
+    def restore_math(m):
+        kind, tex = saved[int(m.group(1))]
+        tag = "div" if kind == "display" else "span"
+        return f'<{tag} class="math {kind}">{_html.escape(tex.strip())}</{tag}>'
+
+    body = re.sub(r"KEEPTOKEN(\d+)END", restore_math, body)
+    body = re.sub(r"<p>(<div class=\"math display\">.*?</div>)</p>", r"\1", body, flags=re.S)
+    body = body.replace("<blockquote>\n<p><strong>시험 포인트", '<blockquote class="exam">\n<p><strong>시험 포인트')
+
+    katex = (f'<link rel="stylesheet" href="{KATEX_CDN}/katex.min.css">'
+             f'<script defer src="{KATEX_CDN}/katex.min.js"></script>'
+             "<script>addEventListener('DOMContentLoaded',()=>{if(!window.katex)return;"
+             "document.querySelectorAll('.math').forEach(e=>{try{katex.render(e.textContent,e,"
+             "{displayMode:e.classList.contains('display'),throwOnError:false})}catch(_){}})})</script>"
+             if saved and any(k != "code" for k, _ in saved) else "")
     return (f"<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<title>{_html.escape(title)}</title><style>{BOOK_CSS}</style></head>"
+            f"<title>{_html.escape(title)}</title><style>{BOOK_CSS}</style>{katex}</head>"
             f"<body>{body}</body></html>")
