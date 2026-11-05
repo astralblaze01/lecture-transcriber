@@ -493,18 +493,22 @@ def _retry_loops(transcribe_clip, piece, sr, rows):
         yield offset, text
 
 
+def _openvino_whisper_pipe(model_dir, device):
+    import openvino_genai as ovg
+
+    key = ("ov", model_dir, device)
+    with _models_lock:
+        if key not in _models:
+            log(f"모델 로드 중: {model_dir} (OpenVINO {device})")
+            Pipe = getattr(ovg, "ASRPipeline", None) or ovg.WhisperPipeline
+            _models[key] = Pipe(model_dir, device)
+        return _models[key]
+
+
 def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None, start_at=0.0):
     try:
-        import openvino_genai as ovg
-        from faster_whisper.audio import decode_audio
         device = device or ov_device() or "CPU"
-        key = ("ov", model_dir, device)
-        with _models_lock:
-            if key not in _models:
-                log(f"모델 로드 중: {model_dir} (OpenVINO {device})")
-                Pipe = getattr(ovg, "ASRPipeline", None) or ovg.WhisperPipeline
-                _models[key] = Pipe(model_dir, device)
-        pipe = _models[key]
+        pipe = _openvino_whisper_pipe(model_dir, device)
         sr = SR
         wav, full = _decode_from(audio, start_at)
     except Exception as e:  # noqa: BLE001
@@ -785,7 +789,7 @@ def ensure_qwen_ov_model():
 
 
 def _qwen_openvino(device):
-    from openvino_genai import ASRPipeline
+    from openvino_genai import ASRPipeline, StreamingStatus
 
     if not QWEN_OV_DIR.is_dir():
         raise _OVStartError("Qwen OpenVINO 모델이 필요해요: install.py --intel-gpu --export-qwen --skip-models")
@@ -797,15 +801,34 @@ def _qwen_openvino(device):
         model = _models[key]
 
     def run(piece, language):
+        fragments = []
+        size, next_check = 0, 64
+        repeated = None
+
+        def stop_on_loop(fragment):
+            nonlocal size, next_check, repeated
+            fragments.append(fragment)
+            size += len(fragment)
+            if repeated is None and size >= next_check:
+                next_check = size + 32
+                text = "".join(fragments)
+                if _has_transcription_loop(text):
+                    repeated = text
+            return StreamingStatus.STOP if repeated is not None else StreamingStatus.RUNNING
+
         with _models_lock:
             try:
-                result = model.generate(piece.tolist(), language=language,
-                                        max_new_tokens=QWEN_MAX_TOKENS)
+                options = {"language": language} if language is not None else {}
+                result = model.generate(
+                    piece.tolist(), max_new_tokens=QWEN_MAX_TOKENS, streamer=stop_on_loop, **options,
+                )
             except RuntimeError:
                 if _models.get(key) is model:
                     del _models[key]
                 raise
-        return result.texts[0].strip() if result.texts else ""
+        text = repeated if repeated is not None else (result.texts[0].strip() if result.texts else "")
+        detected = result.languages[0] if result.languages else None
+        return text, detected
 
     return run
 
@@ -869,36 +892,83 @@ def _qwen_torch(gpu=None):
     return run
 
 
-def run_qwen(audio, lang="ko", gpu=None, on_progress=None, start_at=0.0, **_):
-    language = _qwen_language(lang)
-    run = None
+QWEN_EMPTY_MARKER = "[음성 인식 실패 · 이 구간의 원음을 확인하세요]"
+
+
+def _usable_qwen_text(text):
+    return bool(text) and not _has_transcription_loop(text)
+
+
+def _recover_qwen_openvino(piece, transcribe_piece, device, detected=None, *, tried_auto=False):
+    if not tried_auto:
+        text, detected = transcribe_piece(piece, auto=True)
+        if _usable_qwen_text(text):
+            return text
+
+    parts = []
+    for half in _split_in_half(piece):
+        if not len(half):
+            continue
+        text, _ = transcribe_piece(half, auto=True)
+        if not _usable_qwen_text(text) and len(half) >= 8 * SR:
+            # Retry only the failed half, at most one additional split.
+            smaller = [transcribe_piece(part, auto=True)[0] for part in _split_in_half(half) if len(part)]
+            if smaller and all(_usable_qwen_text(part) for part in smaller):
+                text = " ".join(smaller)
+        parts.append(text)
+    if parts and all(_usable_qwen_text(part) for part in parts):
+        text = " ".join(parts)
+        if _usable_qwen_text(text):
+            return text
+
+    # Use the optional Korean model only when automatic detection identified Korean.
+    if detected not in ("Korean", "ko") or not (KO_OV_DIR / "openvino_encoder_model.xml").is_file():
+        return ""
+    try:
+        pipe = _openvino_whisper_pipe(str(KO_OV_DIR), device)
+        with _models_lock:
+            rows = _openvino_rows(pipe, piece, "ko")
+    except RuntimeError as exc:
+        log(f"Qwen3-ASR BatiSay 구간 재시도 실패: {exc}")
+        return ""
+    text = " ".join(text for _, text in rows).strip()
+    return text if _usable_qwen_text(text) else ""
+
+
+def run_qwen(audio, lang=None, gpu=None, on_progress=None, start_at=0.0, **_):
     backend = gpu_backend(gpu)
+    automatic = backend == "openvino" and (lang is None or lang == "auto")
+    language = None if automatic else _qwen_language(lang if lang and lang != "auto" else "ko")
+    run = None
     if backend == "mlx":
         try:
             run = _qwen_mlx()
         except Exception as exc:  # noqa: BLE001  (설치·내려받기 문제면 CPU로)
             log(f"Qwen3-ASR을 Apple GPU(MLX)로 시작하지 못해 CPU로 바꿔요: {type(exc).__name__}: {exc}")
+    device = None
     if backend == "openvino":
         try:
-            run = _qwen_openvino(ov_device())
+            device = ov_device()
+            run = _qwen_openvino(device)
         except Exception as exc:  # noqa: BLE001 (import, model or device initialization)
             log(f"Qwen3-ASR Intel GPU 시작 실패, CPU로 전환: {exc}")
             gpu = False
             backend = "cpu"
     if run is None:
+        language = language or _qwen_language("ko")
         run = _qwen_torch(gpu)
 
-    def transcribe_piece(piece):
-        nonlocal run, backend
-        try:
-            return run(piece, language)
-        except RuntimeError as exc:
-            if backend != "openvino":
-                raise
-            log(f"Qwen3-ASR Intel GPU 추론 실패, 현재 조각부터 CPU로 전환: {exc}")
-            backend = "cpu"
-        run = _qwen_torch(False)
-        return run(piece, language)
+    def transcribe_piece(piece, auto=False):
+        nonlocal run, backend, language
+        if backend == "openvino":
+            try:
+                return run(piece, None if auto else language)
+            except RuntimeError as exc:
+                log(f"Qwen3-ASR Intel GPU 추론 실패, 현재 조각부터 CPU로 전환: {exc}")
+                backend = "cpu"
+            language = language or _qwen_language("ko")
+            run = _qwen_torch(False)
+        return run(piece, language), None
 
     wav, total = _decode_from(audio, start_at)
     spans = _speech_spans(wav, SR)
@@ -908,24 +978,31 @@ def run_qwen(audio, lang="ko", gpu=None, on_progress=None, start_at=0.0, **_):
         if clips:
             s, e = clips[0][0], clips[-1][1]
             piece = wav[int((a + s) * SR):int((a + e) * SR)]
-            text = transcribe_piece(piece)
-            if _has_transcription_loop(text):
-                # 반복 인식이 나면 조각을 반으로 나눠 다시 시도
+            text, detected = transcribe_piece(piece)
+            repeated = _has_transcription_loop(text)
+            if backend == "openvino" and (repeated or (not text and spans is not None)):
+                mode = "짧게 나눠 자동 언어 감지" if automatic else "자동 언어 감지"
+                log(f"Qwen3-ASR 구간 재시도: {fmt(start_at + a + s)} ({mode})")
+                marker = LOOP_MARKER if repeated else QWEN_EMPTY_MARKER
+                text = _recover_qwen_openvino(
+                    piece, transcribe_piece, device, detected, tried_auto=automatic,
+                ) or marker
+            elif repeated:
                 halves = [h for h in _split_in_half(piece) if len(h)]
-                retry = " ".join(transcribe_piece(h) for h in halves).strip()
-                text = retry if retry and not _has_transcription_loop(retry) else LOOP_MARKER
+                retry = " ".join(transcribe_piece(h)[0] for h in halves).strip()
+                text = retry if _usable_qwen_text(retry) else LOOP_MARKER
             if text:
                 yield start_at + a + s, text
         if on_progress and total:
             on_progress(min((start_at + b) / total, 1.0))
 
 
-def transcribe(audio, engine="ko", lang="ko", gpu=None, on_progress=None, start_at=0.0):
+def transcribe(audio, engine="ko", lang=None, gpu=None, on_progress=None, start_at=0.0):
     """엔진을 골라 (시작초, 텍스트)를 차례로 돌려줌. start_at초부터 시작할 수 있음(이어하기용)."""
     if engine == "ko":
         return run_ko(audio, gpu=gpu, on_progress=on_progress, start_at=start_at)
     if engine == "cohere":
-        return run_cohere(audio, lang, on_progress=on_progress, start_at=start_at)
+        return run_cohere(audio, lang or "ko", on_progress=on_progress, start_at=start_at)
     if engine == "qwen":
         return run_qwen(audio, lang, gpu, on_progress=on_progress, start_at=start_at)
     raise ValueError(f"알 수 없는 엔진: {engine} (가능: {', '.join(ENGINES)})")
@@ -1024,7 +1101,7 @@ def _resume_point(part: Path):
     return float(h * 3600 + mi * 60 + s)
 
 
-def transcribe_to_file(audio, engine="ko", lang="ko", gpu=None, on_progress=None, echo=False, *,
+def transcribe_to_file(audio, engine="ko", lang=None, gpu=None, on_progress=None, echo=False, *,
                        force=False) -> Path:
     """녹음을 <출력 폴더>/<이름>/<이름>.<engine>.txt로 변환. 중간에 끊겨도 다음 실행 때 끊긴 지점부터 이어서 함.
     변환 중에는 <이름>.<engine>.txt.part에 한 줄씩 바로 저장하고, 끝까지 성공하면 이름을 바꿈."""
@@ -1163,7 +1240,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("audio", nargs="?", help="mp3, m4a, wav, mp4 등")
     p.add_argument("--engine", choices=ENGINES, default="ko")
-    p.add_argument("--lang", default="ko")
+    p.add_argument("--lang", help="전사 언어. 생략 시 Qwen Intel GPU는 자동 감지, 그 외는 한국어")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--gpu", dest="gpu", action="store_const", const=True,
                    help="GPU 사용 (Apple Silicon MLX, NVIDIA CUDA, ko 엔진은 Intel OpenVINO도)")

@@ -43,7 +43,7 @@ mcp = FastMCP(
         "[녹음 변환] 경로를 모르면 find_recordings로 찾고, 애매하면 사용자에게 확인하세요. "
         "start_transcription 후 get_transcription을 status가 done이 될 때까지 반복 호출하세요. "
         "CPU로 돌면 1시간 녹음에 수십 분 걸릴 수 있으니(GPU·Apple Silicon은 훨씬 빠름) 진행률을 짧게 알려주세요. "
-        "기본 엔진은 Qwen3-ASR(engine='qwen'), 기본 언어는 한국어(language='ko')입니다. 다른 언어는 language 코드를 지정하세요.\n"
+        "기본 엔진은 Qwen3-ASR(engine='qwen'), Intel GPU에서는 언어를 자동 감지합니다. 언어를 고정하려면 language 코드를 지정하세요.\n"
         "[강의를 책으로] 사용자가 노트/PDF와 녹음을 바탕으로 정리·책·요약을 원하면: "
         "1) prepare_lecture_note로 노트를 풀고 녹음 변환을 시작, "
         "2) 기다리는 동안 read_pdf_text로 슬라이드 내용 파악, "
@@ -203,13 +203,13 @@ def find_recordings(folder: str = "", limit: int = 15) -> str:
 
 
 @mcp.tool()
-def start_transcription(file_path: str, engine: str = "qwen", language: str = "ko",
+def start_transcription(file_path: str, engine: str = "qwen", language: str | None = None,
                         gpu: bool | None = None, force: bool = False) -> str:
     """녹음 파일을 텍스트로 변환하는 작업을 시작하고 job_id를 돌려줍니다.
     engine: 'qwen'(기본, Qwen3-ASR 1.7B, 다국어·방언, 약 30초 단위 타임스탬프)
             | 'ko'(한국어 특화, BatiSay) | 'cohere'(GPU 권장)
     gpu: 비우면 지원 GPU 자동 사용, false면 CPU 강제. Intel GPU(OpenVINO)는 ko와 qwen을 지원하며, 해당 OpenVINO 모델이 필요합니다.
-    language: 'ko', 'en' 등. 이미 변환한 파일은 force=false면 저장된 결과를 바로 씁니다."""
+    language: 'ko', 'en' 등. 생략하면 Qwen Intel GPU는 자동 감지하고 그 외 경로는 한국어를 사용합니다. 이미 변환한 파일은 force=false면 저장된 결과를 바로 씁니다."""
     path = _clean_path(file_path)
     if not path.is_file():
         return f"파일이 없어요: {path}  (find_recordings로 경로를 확인하세요)"
@@ -271,12 +271,12 @@ def _remember_dir(d: Path):
 
 
 @mcp.tool()
-def prepare_lecture_note(note_path: str, engine: str = "qwen", language: str = "ko",
+def prepare_lecture_note(note_path: str, engine: str = "qwen", language: str | None = None,
                          gpu: bool | None = None, force: bool = False) -> str:
     """강의 노트를 책으로 만들기 위한 준비를 한 번에 합니다.
     .sdocx(삼성노트)면 압축을 풀어 녹음과 PDF를 꺼내고, 녹음 변환 작업을 바로 시작합니다.
     .pdf면 같은 폴더에서 이름이 비슷한 녹음을 찾아 변환을 시작합니다.
-    기본 엔진은 qwen, 기본 언어는 ko입니다. gpu를 비우면 지원 GPU를 자동 선택합니다.
+    기본 엔진은 qwen입니다. Qwen Intel GPU는 언어를 생략하면 자동 감지합니다.
     돌려준 job_id들로 get_transcription, PDF 경로로 read_pdf_text를 쓰세요."""
     path = _clean_path(note_path)
     if not path.is_file():

@@ -61,12 +61,14 @@ Windows PowerShell에서 프로젝트 폴더를 열고 실행하세요.
 ```powershell
 .\.venv\Scripts\python.exe install.py --intel-gpu --export-qwen --skip-models
 .\.venv\Scripts\python.exe transcribe.py --doctor
-.\.venv\Scripts\python.exe transcribe.py ".\sample.wav" --engine qwen --lang ko --gpu
+.\.venv\Scripts\python.exe transcribe.py ".\sample.wav" --engine qwen --gpu
 ```
 
 최초 준비 시 공식 Qwen 체크포인트를 다운로드해 INT8로 변환해요. 변환용 `qwen-asr`와 Optimum Intel은 `.venv-export-qwen`에 설치하고, 결과는 `models/qwen3-asr-1.7b-ov-int8`에 저장해요. 메인 환경에 예전 설치의 `optimum-intel`이 남아 의존성 충돌이 발생하면 `.\.venv\Scripts\python.exe -m pip uninstall optimum-intel`로 해당 패키지를 제거한 뒤 `pip check`를 실행하세요.
 
 `--doctor`는 장치와 모델 폴더를 확인해요. 실제 전사는 짧은 음성 파일로 확인하세요. GPU 초기화나 추론이 실패하면 이유를 표시하고 해당 조각부터 CPU로 이어갑니다. `--cpu`를 사용하면 처음부터 CPU로 실행해요.
+
+Intel GPU의 Qwen은 CLI와 MCP에서 언어를 생략하면 구간마다 자동 감지해요. 언어를 지정하려면 CLI에서 `--lang ko` 또는 MCP에서 `language: "ko"`를 사용하세요. 전사 중 반복이 감지되면 생성을 조기에 끊어요. 말소리가 있는데 결과가 비거나 반복 오류가 나면 같은 Qwen 모델로 해당 구간만 재시도해요. 이미 자동 감지한 구간은 같은 입력을 다시 실행하는 대신 짧게 나눠 재시도해요. 둘 중 긴 조각이 여전히 실패하면 해당 조각만 한 번 더 나누고, 복구하지 못한 한국어 구간은 준비된 BatiSay 모델로 한 번 더 시도해요.
 
 [OpenVINO GenAI ASR 문서](https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/speech-recognition/)
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).

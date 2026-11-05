@@ -510,7 +510,7 @@ def test_qwen_openvino_resume_and_fallback(monkeypatch, fail_at):
             assert language == "Korean"
             if fail_at == "second" and len(calls) == 2:
                 raise RuntimeError("GPU out of memory")
-            return "GPU text"
+            return "GPU text", "Korean"
         return generate
 
     def torch(gpu):
@@ -529,7 +529,7 @@ def test_qwen_openvino_resume_and_fallback(monkeypatch, fail_at):
     monkeypatch.setattr(tr, "_decode_from", decode)
     monkeypatch.setattr(tr, "_speech_spans", lambda *args: None)
     monkeypatch.setattr(tr, "_cut_points", lambda *args, **kwargs: [0.0, 1.0, 2.0])
-    rows = list(tr.run_qwen("sample.wav", start_at=3.0, on_progress=progress.append))
+    rows = list(tr.run_qwen("sample.wav", lang="ko", start_at=3.0, on_progress=progress.append))
     assert [ts for ts, _ in rows] == [3.0, 4.0]
     assert progress == [0.8, 1.0]
     assert calls == {None: ["GPU", "GPU"], "load": ["CPU", "CPU"],
@@ -538,3 +538,112 @@ def test_qwen_openvino_resume_and_fallback(monkeypatch, fail_at):
         None: ["GPU text", "GPU text"], "load": ["CPU text", "CPU text"],
         "second": ["GPU text", "CPU text"],
     }[fail_at]
+
+
+@pytest.mark.parametrize("first", ["", "loop"])
+def test_qwen_openvino_retries_only_failed_speech(monkeypatch, first):
+    wav = np.zeros(3 * tr.SR, dtype=np.float32)
+    calls = []
+    responses = iter([(first, "Korean"), ("English recovered", "English"), ("healthy", "Korean")])
+
+    def generate(piece, language):
+        calls.append(language)
+        return next(responses)
+
+    monkeypatch.setattr(tr, "_qwen_language", lambda lang: "Korean")
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu: "openvino")
+    monkeypatch.setattr(tr, "ov_device", lambda: "GPU")
+    monkeypatch.setattr(tr, "_qwen_openvino", lambda device: generate)
+    monkeypatch.setattr(tr, "_decode_from", lambda *args: (wav, 7.0))
+    monkeypatch.setattr(tr, "_speech_spans", lambda *args: [(0.0, 0.75), (2.2, 3.0)])
+    monkeypatch.setattr(tr, "_cut_points", lambda *args, **kwargs: [0.0, 1.0, 2.0, 3.0])
+    monkeypatch.setattr(tr, "_has_transcription_loop", lambda text: text == "loop")
+    assert list(tr.run_qwen("sample.wav", lang="ko", start_at=4.0)) == [
+        (4.0, "English recovered"), (6.0, "healthy"),
+    ]
+    assert calls == ["Korean", None, "Korean"]
+
+
+@pytest.mark.parametrize("detected, expected", [("Korean", "BatiSay text"), ("English", "")])
+def test_qwen_openvino_batisay_only_after_korean_detection(tmp_path, monkeypatch, detected, expected):
+    (tmp_path / "openvino_encoder_model.xml").touch()
+    monkeypatch.setattr(tr, "KO_OV_DIR", tmp_path)
+    monkeypatch.setattr(tr, "_openvino_whisper_pipe", lambda *args: object())
+    monkeypatch.setattr(tr, "_openvino_rows", lambda *args: [(0.0, "BatiSay text")])
+    calls = []
+
+    def empty(piece, auto):
+        assert auto
+        calls.append(len(piece))
+        return "", detected
+
+    wav = np.zeros(2 * tr.SR, dtype=np.float32)
+    assert tr._recover_qwen_openvino(wav, empty, "GPU") == expected
+    assert len(calls) == 3
+
+
+def test_qwen_openvino_auto_does_not_retry_the_same_full_chunk(monkeypatch):
+    wav = np.zeros(2 * tr.SR, dtype=np.float32)
+    calls = []
+    responses = iter([("", "English"), ("first half", "English"), ("second half", "English")])
+
+    def generate(piece, language):
+        calls.append((len(piece), language))
+        return next(responses)
+
+    monkeypatch.setattr(tr, "_qwen_language", lambda lang: "Korean")
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu: "openvino")
+    monkeypatch.setattr(tr, "ov_device", lambda: "GPU")
+    monkeypatch.setattr(tr, "_qwen_openvino", lambda device: generate)
+    monkeypatch.setattr(tr, "_decode_from", lambda *args: (wav, 2.0))
+    monkeypatch.setattr(tr, "_speech_spans", lambda *args: [(0.0, 2.0)])
+    monkeypatch.setattr(tr, "_cut_points", lambda *args, **kwargs: [0.0, 2.0])
+    assert list(tr.run_qwen("sample.wav")) == [(0.0, "first half second half")]
+    assert calls == [(2 * tr.SR, None), (tr.SR, None), (tr.SR, None)]
+
+
+def test_qwen_openvino_splits_only_the_failed_half(monkeypatch):
+    wav = np.zeros(28 * tr.SR, dtype=np.float32)
+    responses = iter([("left", "English"), ("", "English"),
+                      ("right one", "English"), ("right two", "English")])
+    calls = []
+
+    def generate(piece, auto):
+        assert auto
+        calls.append(len(piece) // tr.SR)
+        return next(responses)
+
+    monkeypatch.setattr(tr, "_split_in_half", lambda piece: np.array_split(piece, 2))
+    assert tr._recover_qwen_openvino(wav, generate, "GPU", "English", tried_auto=True) == (
+        "left right one right two"
+    )
+    assert calls == [14, 14, 7, 7]
+
+
+def test_qwen_openvino_stops_generation_on_repeat_and_keeps_gpu_model(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    statuses = SimpleNamespace(RUNNING=0, STOP=1)
+    repeated = "repeat the same sentence " * 8
+    fragments = iter([repeated, "normal output"])
+    devices = []
+
+    class Pipeline:
+        def __init__(self, path, device):
+            devices.append(device)
+
+        def generate(self, audio, *, max_new_tokens, streamer, **kwargs):
+            fragment = next(fragments)
+            assert streamer(fragment) == (statuses.STOP if fragment == repeated else statuses.RUNNING)
+            return SimpleNamespace(texts=["normal output"], languages=["English"])
+
+    monkeypatch.setitem(sys.modules, "openvino_genai",
+                        SimpleNamespace(ASRPipeline=Pipeline, StreamingStatus=statuses))
+    monkeypatch.setattr(tr, "QWEN_OV_DIR", tmp_path)
+    monkeypatch.setattr(tr, "_models", {})
+    wav = np.zeros(tr.SR, dtype=np.float32)
+    stopped, language = tr._qwen_openvino("GPU")(wav, None)
+    assert tr._has_transcription_loop(stopped)
+    assert language == "English"
+    assert tr._qwen_openvino("GPU")(wav, None) == ("normal output", "English")
+    assert devices == ["GPU"]
