@@ -31,15 +31,15 @@ def sniff(head: bytes):
     return None, None
 
 
-def extract_note(note: Path) -> dict:
-    """sdocx(압축 파일) 안의 녹음·PDF를 '<이름>_추출' 폴더로 꺼냄. 이미 꺼냈으면 재사용."""
-    out_dir = note.with_name(note.stem + "_추출")
+def extract_note(note: Path, out_dir: Path | None = None) -> dict:
+    """sdocx(압축 파일) 안의 녹음·PDF를 out_dir(기본: 노트 옆 '<이름>_추출')로 꺼냄. 이미 꺼냈으면 재사용."""
+    out_dir = Path(out_dir) if out_dir else note.with_name(note.stem + "_추출")
     if not zipfile.is_zipfile(note):
         with note.open("rb") as f:
             head = f.read(16)
         raise ValueError(f"압축 형식이 아니에요 (앞부분: {head!r}). 삼성노트 앱에서 PDF/녹음을 직접 내보내 주세요.")
 
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     found = {AUDIO: [], PDF: [], IMAGE: 0}
     with zipfile.ZipFile(note) as z:
         for i, info in enumerate(sorted(z.infolist(), key=lambda x: x.filename)):

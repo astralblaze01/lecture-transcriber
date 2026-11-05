@@ -30,7 +30,7 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 |---|---|---|---|---|
 | `ko` (기본) | [batiai/batisay-ko-turbo](https://huggingface.co/batiai/batisay-ko-turbo) — Whisper large-v3-turbo를 한국어로 파인튜닝 | faster-whisper (int8) | 빠름 | 한국어 강의·회의 |
 | `whisper` | OpenAI Whisper (`--model`로 `large-v3`, `large-v3-turbo` 등 선택) | faster-whisper (int8) | 빠름 | 영어 등 다른 언어, 여러 언어가 섞인 녹음 |
-| `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 |
+| `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 (`transformers>=5.4` 필요) |
 
 **faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 한국어 녹음에 맞춘 모델을 사용할 수 있어요.
 
@@ -40,13 +40,17 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 |---|---|---|---|
 | NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16) | `ko`, `whisper` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
 | 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
-| AMD Radeon | 아직 미지원 (CPU로 동작) | — | — |
+| AMD Radeon 등 DX12 GPU (Windows) | ONNX Runtime + DirectML | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `install.py --amd-gpu` 또는 `setup.bat`(AMD 그래픽만 있을 때 자동). 모델을 ONNX로 1회 변환 |
 
-자동 순서는 NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. 인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요.
+자동 순서는 NVIDIA → 인텔 GPU → DirectML(AMD 등) → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. 인텔 GPU·DirectML 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요.
+
+어떤 경로가 실제로 쓰이는지는 `python transcribe.py --doctor`(Claude에서는 `check_setup` 도구)로 확인하세요. 장치 감지, 준비된 모델, 결과 저장 폴더를 보여 주고 10초 시험 음성을 그 경로로 실제 변환해 봐요.
+
+> DirectML 경로는 AMD 실기기에서 아직 측정하지 못했어요. 같은 코드를 CPU 실행 장치로 바꿔 ONNX 변환·타임스탬프 변환·이어하기·반복 복구까지 검증했어요. AMD에서 돌려 보면 `--doctor` 결과를 이슈로 남겨 주세요. 인텔용 `optimum-intel`과 AMD용 `optimum-onnx`는 서로 다른 버전을 요구해서 한 가상환경에 같이 설치할 수 없어요.
 
 - Intel GPU에서 일반 Whisper 모델을 처음 사용하면 `large-v3`는 약 3.1GB, `large-v3-turbo`는 약 1.6GB의 가중치를 내려받아 OpenVINO로 변환합니다. 이후에는 저장된 모델을 재사용합니다.
 - 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
-- `ko`, `whisper`는 타임스탬프가 붙고, `cohere`는 타임스탬프 없이 문장 단위로만 나와요.
+- `ko`, `whisper`는 문장마다 타임스탬프가 붙어요. `cohere`는 모델이 타임스탬프를 주지 않아서 녹음을 조용한 틈에서 약 20초씩 잘라 조각마다 변환하고, 조각 시작 시각을 붙여요. 덕분에 `cohere`도 이어하기와 반복 복구가 돼요.
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
 - 정확도 차이는 녹음 상태에 따라 달라요. 결과는 엔진·모델마다 따로 저장되니 같은 녹음을 여러 모델로 돌려 직접 비교해보세요: `녹음.ko.txt`, `녹음.whisper.txt`(large-v3-turbo), `녹음.whisper.large-v3.txt`, `녹음.whisper.small.txt` 등.
 
@@ -84,11 +88,31 @@ python3 install.py
 녹음 파일 경로를 붙여넣고 모델 번호를 선택합니다. 파일 경로를 인자로 직접 넘길 수도 있습니다. Windows에서 기존 `setup.bat`과 `transcribe_menu.bat`도 사용할 수 있습니다.
 
 - **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko`, `whisper large-v3`, `whisper large-v3-turbo`에서 사용합니다.
+- **AMD GPU** · Windows에서 설치 명령에 `--amd-gpu`를 추가합니다(DirectML, `--intel-gpu`와 함께 쓸 수 없음). DX12를 지원하는 최신 그래픽 드라이버가 필요해요.
 - **NVIDIA GPU** · x86-64 Windows/Linux에서 설치 명령에 `--nvidia-gpu`를 추가하면 CTranslate2용 cuBLAS·cuDNN을 pip로 설치합니다(CUDA Toolkit 불필요, 최신 드라이버 필요). Windows의 기존 `setup.bat`은 `nvidia-smi`가 있으면 자동으로 설치합니다.
 - **모델 미리 준비** · `install.py`는 한국어 모델을 설치 중에 미리 내려받아 변환합니다(`--intel-gpu`면 OpenVINO 형식까지). 첫 변환이 멈춘 것처럼 보이지 않게 하려는 것이고, 나중으로 미루려면 `--skip-models`를 붙이세요.
 - **macOS** · 현재 이 프로젝트는 CPU 경로로 실행합니다.
 - **Claude Desktop** · Windows/macOS에서 설치 명령에 `--register-claude`를 추가한 뒤 앱을 완전히 종료하고 다시 실행합니다.
 - **Linux MCP 클라이언트** · stdio 서버로 등록합니다. 실행 명령에는 가상환경 Python의 절대 경로, 인자에는 `transcribe_mcp.py`의 절대 경로를 지정합니다.
+
+## 결과 저장 위치
+
+변환 결과, 삼성노트에서 꺼낸 파일, 정리본은 원본 옆이 아니라 **설치 폴더의 `output` 폴더** 한 곳에 녹음·노트별로 모여요. 원본이 있는 폴더(다운로드 등)에는 아무것도 만들지 않아요.
+
+```
+output/
+├─ 운영체제 3주차/              ← 녹음 하나
+│  ├─ source.txt               (원본 파일 경로)
+│  ├─ 운영체제 3주차.ko.txt
+│  └─ 운영체제 3주차.whisper.large-v3.txt
+└─ Lecture12_…/                ← 삼성노트 하나
+   ├─ 추출/                     (노트에서 꺼낸 녹음·PDF와 각 녹음의 변환 결과)
+   └─ 정리본/                   (책 .html / .md)
+```
+
+- 다른 곳에 두려면 설치 폴더에 `config.json`을 만들어 `{"output_dir": "D:/강의결과"}`처럼 적거나, 환경 변수 `TRANSCRIBE_OUTPUT_DIR`을 설정하세요. `config.json`은 `.gitignore`에 들어 있어 개인 경로가 저장소에 올라가지 않아요.
+- 이름이 같은 녹음이 다른 폴더에 있으면 `강의_1a2b3c`처럼 구분해서 겹치지 않아요.
+- 예전 버전이 원본 옆에 만든 결과(`녹음.ko.txt`)가 있으면 새 위치로 복사해서 다시 변환하지 않고 그대로 써요.
 
 ## 사용 예 (Claude 데스크톱 앱)
 
@@ -104,7 +128,8 @@ python3 install.py
 | `start_transcription` / `get_transcription` | 변환 작업 시작 / 진행률·결과 조회 (긴 텍스트는 offset으로 나눠 받음) |
 | `prepare_lecture_note` | .sdocx를 풀거나 PDF 옆의 녹음을 찾아 변환까지 시작 |
 | `read_pdf_text` | PDF 페이지별 텍스트 |
-| `save_book` | 원고를 `.md` + `.html`로 저장 (처리한 노트 폴더에만 쓰기 허용) |
+| `save_book` | 원고를 `.md` + `.html`로 `output/<노트>/정리본`에 저장 (출력 폴더 밖에는 쓰지 않음) |
+| `check_setup` | 설치·GPU 상태 점검과 10초 시험 변환 |
 
 ## 명령줄로 쓰기
 
@@ -117,7 +142,7 @@ Windows 예시입니다. macOS와 Linux에서는 Python 경로를 `.venv/bin/pyt
 
 ## 테스트
 
-모델 없이 핵심 동작(결과 파일 이름, 반복 인식 복구, 이어하기, 녹음 자르기, 삼성노트 풀기, 책 HTML)을 확인합니다.
+모델 없이 핵심 동작(결과 저장 위치, 반복 인식 복구, 이어하기, Cohere 조각 타임스탬프, GPU 선택과 CPU 전환, 녹음 자르기, 삼성노트 풀기, 책 HTML, 자가 진단)을 확인합니다. GitHub에 push하면 Ubuntu·Windows에서 자동으로 돌아요.
 
 ```bash
 pip install pytest
@@ -127,7 +152,7 @@ python -m pytest -q tests
 ## 구조
 
 ```
-Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) → faster-whisper → 녹음.ko.txt
+Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) → 변환 엔진(CUDA·OpenVINO·DirectML·CPU) → output/<녹음>/녹음.ko.txt
 ```
 
 - `transcribe.py`: 변환 엔진 (CLI 겸용)

@@ -42,6 +42,13 @@ if not errorlevel 1 (
   %PY% -m pip install -q openvino-genai "optimum-intel[openvino]" "transformers>=4.51,<5" && %PY% -c "import transcribe as t; d=t.ov_device(); print('[GPU] OpenVINO device:', d); d and t.ensure_ko_ov_model()" || echo [GPU] OpenVINO setup failed - continuing with CPU.
 )
 
+powershell -NoProfile -Command "$n=(Get-CimInstance Win32_VideoController).Name -join ' '; if (($n -match 'AMD|Radeon') -and -not ($n -match 'NVIDIA|Intel')) { exit 0 } else { exit 1 }" >nul 2>nul
+if not errorlevel 1 (
+  echo [GPU] AMD GPU found - installing DirectML...
+  %PY% -m pip uninstall -y -q onnxruntime
+  %PY% -m pip install -q onnxruntime-directml optimum-onnx "transformers>=4.51,<4.58" && %PY% -c "import transcribe as t; ok=t.directml_available(); print('[GPU] DirectML:', ok); ok and t.ensure_onnx_model(t.KO_REPO, t.KO_ONNX_DIR)" || echo [GPU] DirectML setup failed - continuing with CPU.
+)
+
 echo [4/5] 한국어 모델 내려받고 변환 중... (최초 1회, 5~10분)
 %PY% -c "import transcribe; transcribe.ensure_ko_model()" || goto :fail
 

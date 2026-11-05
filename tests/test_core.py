@@ -11,6 +11,62 @@ import lecture_tools as lt  # noqa: E402
 import transcribe as tr  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _output_dir(tmp_path, monkeypatch):
+    """테스트마다 결과를 임시 출력 폴더에 저장"""
+    out = tmp_path / "output"
+    monkeypatch.setenv("TRANSCRIBE_OUTPUT_DIR", str(out))
+    return out
+
+
+# ---------- 결과 저장 위치 ----------
+def test_results_go_to_fixed_output_folder(tmp_path, _output_dir, monkeypatch):
+    audio = tmp_path / "Downloads" / "강의.m4a"
+    audio.parent.mkdir()
+    audio.write_bytes(b"x")
+    monkeypatch.setattr(tr, "transcribe", lambda *a, **k: iter([(0.0, "문장")]))
+    out = tr.transcribe_to_file(str(audio))
+    assert out == _output_dir / "강의" / "강의.ko.txt"
+    assert (_output_dir / "강의" / "source.txt").read_text(encoding="utf-8") == str(audio.resolve())
+    assert not list(audio.parent.glob("*.txt"))          # 원본 폴더는 건드리지 않음
+    assert tr.finished_outputs(audio) == ["ko"]
+
+
+def test_same_name_from_different_folders_does_not_collide(tmp_path, _output_dir):
+    a, b = tmp_path / "a" / "강의.m4a", tmp_path / "b" / "강의.m4a"
+    for f in (a, b):
+        f.parent.mkdir()
+        f.write_bytes(b"x")
+    first = tr.work_dir(a, create=True)
+    second = tr.work_dir(b, create=True)
+    assert first == _output_dir / "강의" and second != first and second.name.startswith("강의_")
+    assert tr.work_dir(a) == first and tr.work_dir(b) == second   # 다시 불러도 같은 폴더
+
+
+def test_files_already_in_output_folder_keep_their_folder(_output_dir):
+    extracted = _output_dir / "Lecture12" / "추출" / "01_rec.m4a"
+    extracted.parent.mkdir(parents=True)
+    extracted.write_bytes(b"x")
+    assert tr.output_path(extracted, "ko") == extracted.parent / "01_rec.ko.txt"
+
+
+def test_legacy_result_next_to_source_is_reused(tmp_path, _output_dir, monkeypatch):
+    audio = tmp_path / "rec.m4a"
+    audio.write_bytes(b"x")
+    (tmp_path / "rec.ko.txt").write_text("[00:00:00] 예전 결과\n", encoding="utf-8")
+    monkeypatch.setattr(tr, "transcribe", lambda *a, **k: pytest.fail("다시 변환하면 안 됨"))
+    out = tr.transcribe_to_file(str(audio))
+    assert out.parent == _output_dir / "rec" and "예전 결과" in out.read_text(encoding="utf-8")
+
+
+def test_output_dir_from_config_json(tmp_path, monkeypatch):
+    monkeypatch.delenv("TRANSCRIBE_OUTPUT_DIR")
+    monkeypatch.setattr(tr, "HERE", tmp_path)
+    assert tr.output_root() == tmp_path / "output"
+    (tmp_path / "config.json").write_text('{"output_dir": "D:/강의결과"}', encoding="utf-8")
+    assert tr.output_root() == Path("D:/강의결과")
+
+
 # ---------- 결과 파일 이름 ----------
 @pytest.mark.parametrize("engine,model,name", [
     ("ko", "large-v3-turbo", "강의.ko.txt"),
@@ -100,8 +156,9 @@ def test_resume_from_interrupted_part(tmp_path, monkeypatch):
 def test_force_ignores_existing_result_and_part(tmp_path, monkeypatch):
     audio = tmp_path / "rec.m4a"
     audio.write_bytes(b"x")
-    (tmp_path / "rec.ko.txt").write_text("옛 결과\n", encoding="utf-8")
-    (tmp_path / "rec.ko.txt.part").write_text("[00:05:00] 옛 조각\n", encoding="utf-8")
+    wd = tr.work_dir(audio, create=True)
+    (wd / "rec.ko.txt").write_text("옛 결과\n", encoding="utf-8")
+    (wd / "rec.ko.txt.part").write_text("[00:05:00] 옛 조각\n", encoding="utf-8")
     seen = []
     monkeypatch.setattr(tr, "transcribe", lambda *a, start_at=0.0, **k: seen.append(start_at) or iter([(0.0, "새 결과")]))
     out = tr.transcribe_to_file(str(audio), force=True)
@@ -146,3 +203,130 @@ def test_book_html_math_lists_and_exam_box():
     assert '<blockquote class="exam">' in html and html.count("<blockquote>") == 1
     assert "<mark>형광펜</mark>" in html and "<code>a == b</code>" in html
     assert "KEEPTOKEN" not in html
+
+
+# ---------- Cohere: 조각별 타임스탬프·이어하기·반복 복구 ----------
+class _CohereInputs(dict):
+    def to(self, *a, **k):
+        return self
+
+
+class _FakeCohere:
+    """조각 길이(초)를 텍스트로 돌려주고, loop_at 길이의 조각에는 반복 텍스트를 돌려줌."""
+    device, dtype = "cpu", None
+
+    def __init__(self, loop_seconds=()):
+        self.loop_seconds, self.batches = set(loop_seconds), []
+
+    def __call__(self, audio, sampling_rate, return_tensors, language):
+        pieces = audio if isinstance(audio, list) else [audio]
+        self.batches.append([round(len(p) / tr.SR) for p in pieces])
+        return _CohereInputs(lengths=[len(p) / tr.SR for p in pieces])
+
+    def generate(self, lengths, max_new_tokens):
+        return lengths
+
+    def decode(self, lengths, skip_special_tokens):
+        return [("반복 문장입니다 " * 8) if round(n) in self.loop_seconds else f"{round(n)}초 분량" for n in lengths]
+
+
+def _setup_cohere(monkeypatch, fake, total=100):
+    import faster_whisper.vad as vad
+    monkeypatch.setattr(tr, "_cohere_model", lambda: (fake, fake))
+    wav = np.zeros(total * tr.SR, np.float32)
+    monkeypatch.setattr(tr, "_decode_from", lambda audio, s: (wav[int(s * tr.SR):], total))
+    # 10초마다 말이 끊기는 녹음 (9~10초 구간이 조용함)
+    monkeypatch.setattr(vad, "get_speech_timestamps",
+                        lambda w, o=None, **k: [{"start": t * tr.SR, "end": (t + 9) * tr.SR}
+                                                for t in range(0, int(len(w) / tr.SR), 10)])
+
+
+def test_cohere_emits_piece_timestamps_in_batches(monkeypatch):
+    fake = _FakeCohere()
+    _setup_cohere(monkeypatch, fake)
+    rows = list(tr.run_cohere("a.m4a"))
+    starts = [r[0] for r in rows]
+    assert starts[0] == 0 and starts == sorted(starts) and len(rows) >= 4
+    assert all(s % 10 == 9.5 for s in starts[1:])        # 조용한 틈에서 자름
+    assert all(len(b) <= tr.COHERE_BATCH for b in fake.batches)
+
+
+def test_cohere_resumes_with_absolute_timestamps(monkeypatch):
+    fake = _FakeCohere()
+    _setup_cohere(monkeypatch, fake)
+    rows = list(tr.run_cohere("a.m4a", start_at=40.0))
+    assert rows[0][0] == 40.0 and all(r[0] >= 40.0 for r in rows)
+
+
+def test_cohere_loop_piece_is_split_and_retried(monkeypatch):
+    fake = _FakeCohere()
+    _setup_cohere(monkeypatch, fake, total=20)          # 20초 → 조각 하나
+    fake.loop_seconds = {20}
+    rows = list(tr.run_cohere("a.m4a"))
+    assert fake.batches[-1] == [10, 10] or sum(fake.batches[-1]) == 20   # 반으로 나눠 재시도
+    assert len(rows) == 1 and not tr._has_transcription_loop(rows[0][1])
+    fake.batches.clear()
+    fake.loop_seconds = {20, 10}                         # 나눠도 반복이면 표시
+    assert list(tr.run_cohere("a.m4a")) == [(0.0, tr.LOOP_MARKER)]
+
+
+# ---------- GPU 선택·DirectML·자가 진단 ----------
+@pytest.mark.parametrize("cuda,intel,dml,gpu,expected", [
+    (True, True, True, None, "cuda"),
+    (False, True, True, None, "openvino"),
+    (False, False, True, None, "directml"),
+    (False, False, False, None, "cpu"),
+    (True, True, True, False, "cpu"),          # --cpu 강제
+])
+def test_gpu_backend_order(monkeypatch, cuda, intel, dml, gpu, expected):
+    monkeypatch.setattr(tr, "cuda_available", lambda: cuda)
+    monkeypatch.setattr(tr, "intel_gpu_available", lambda: intel)
+    monkeypatch.setattr(tr, "directml_available", lambda: dml)
+    assert tr.gpu_backend(gpu) == expected
+
+
+def test_gpu_start_failure_falls_back_to_cpu(monkeypatch):
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "directml")
+    monkeypatch.setattr(tr, "ensure_onnx_model", lambda *a: (_ for _ in ()).throw(tr._GPUStartError("no driver")))
+    monkeypatch.setattr(tr, "ensure_ko_model", lambda: "ct2")
+    monkeypatch.setattr(tr, "run_whisper", lambda *a, **k: iter([(0.0, "CPU로 변환")]))
+    assert list(tr.run_ko("a.m4a")) == [(0.0, "CPU로 변환")]
+
+
+def test_onnx_rows_reads_pipeline_chunks():
+    pipe = lambda audio, **kw: {"text": "가 나", "chunks": [{"timestamp": (0.0, 2.0), "text": " 가"},
+                                                         {"timestamp": (None, None), "text": " 나 "},
+                                                         {"timestamp": (3.0, 4.0), "text": "  "}]}
+    assert tr._onnx_rows(pipe, np.zeros(10, np.float32), "ko") == [(0.0, "가"), (0.0, "나")]
+    assert tr._onnx_rows(lambda a, **k: {"text": " 전체 "}, None, "ko") == [(0.0, "전체")]
+
+
+def test_stale_export_folders_are_cleaned(tmp_path):
+    import os
+    import time
+    old, fresh, model = tmp_path / "tmpold", tmp_path / "tmpnew", tmp_path / "ready-model"
+    for d in (old, fresh, model):
+        (d / "model").mkdir(parents=True)
+        (d / "model" / "w.bin").write_bytes(b"x")
+    past = time.time() - 5 * 3600
+    for f in (old / "model" / "w.bin", old / "model", old, model / "model" / "w.bin"):
+        os.utime(f, (past, past))
+    tr._clean_stale_exports(tmp_path)
+    assert not old.exists() and fresh.exists() and model.exists()
+
+
+def test_doctor_reports_and_skips_test_without_models(monkeypatch, tmp_path):
+    for name in ("KO_DIR", "KO_OV_DIR", "KO_ONNX_DIR", "LARGE_V3_OV_DIR", "LARGE_V3_TURBO_OV_DIR"):
+        monkeypatch.setattr(tr, name, tmp_path / name)
+    monkeypatch.setattr(tr, "_WHISPER_ONNX_DIRS", {k: tmp_path / k for k in tr._WHISPER_ONNX_DIRS})
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "cpu")
+    report = tr.doctor(run_test=True)
+    assert "자동 선택: cpu" in report and "준비된 모델: 없음" in report and "건너뜀" in report
+
+
+def test_install_rejects_conflicting_gpu_options():
+    import subprocess
+    root = Path(__file__).resolve().parents[1]
+    r = subprocess.run([sys.executable, str(root / "install.py"), "--amd-gpu", "--intel-gpu"],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and ("Windows only" in r.stderr or "Choose one" in r.stderr)

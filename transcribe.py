@@ -5,7 +5,7 @@
 엔진
   ko      : batiai/batisay-ko-turbo (Whisper turbo 한국어 파인튜닝, 타임스탬프 O) ← 한국어 추천
   whisper : faster-whisper 기본 모델 (다국어, 타임스탬프 O)
-  cohere  : CohereLabs/cohere-transcribe-03-2026 (오픈 ASR 리더보드 1위, 타임스탬프 X, GPU 권장)
+  cohere  : CohereLabs/cohere-transcribe-03-2026 (오픈 ASR 리더보드 1위, 약 20초 단위 타임스탬프, GPU 권장)
 
 사용
   python transcribe.py 녹음.m4a                       # ko 엔진
@@ -187,15 +187,33 @@ def _retry_whisper_loop(model, wav, start, end, lang):
     return LOOP_MARKER
 
 
+def gpu_backend(gpu=None) -> str:
+    """쓸 가속 방식. 자동 순서: NVIDIA(CUDA) → 인텔 GPU(OpenVINO) → 그 밖의 DX12 GPU(DirectML, AMD 등) → CPU.
+    gpu=False면 항상 'cpu'."""
+    if gpu is False:
+        return "cpu"
+    if cuda_available():
+        return "cuda"
+    if intel_gpu_available():
+        return "openvino"
+    if directml_available():
+        return "directml"
+    return "cpu"
+
+
 def run_ko(audio, gpu=None, on_progress=None, start_at=0.0, **_):
-    # 자동 모드: NVIDIA(CUDA) → 인텔 GPU(OpenVINO) → CPU 순서
-    if gpu is not False and not cuda_available() and intel_gpu_available():
-        try:
+    backend = gpu_backend(gpu)
+    try:
+        if backend == "openvino":
             yield from run_openvino(audio, ensure_ko_ov_model(), "ko", on_progress=on_progress,
                                     start_at=start_at)
             return
-        except _OVStartError as e:
-            log(f"인텔 GPU로 시작하지 못해 CPU로 바꿔요: {e}")
+        if backend == "directml":
+            yield from run_onnx(audio, ensure_onnx_model(KO_REPO, KO_ONNX_DIR), "ko",
+                                on_progress=on_progress, start_at=start_at)
+            return
+    except _GPUStartError as e:
+        log(f"GPU({backend})로 시작하지 못해 CPU로 바꿔요: {e}")
     yield from run_whisper(audio, "ko", ensure_ko_model(), gpu, on_progress, start_at)
 
 
@@ -210,8 +228,13 @@ _WHISPER_OV_DIRS = {
 }
 
 
-class _OVStartError(RuntimeError):
-    """OpenVINO로 시작조차 못 했을 때(설치·변환·장치 문제). 이미 텍스트를 내보낸 뒤의 오류와 구분."""
+class _GPUStartError(RuntimeError):
+    """GPU 경로로 시작조차 못 했을 때(설치·변환·장치 문제). 이미 텍스트를 내보낸 뒤의 오류와 구분.
+    이 예외가 나면 CPU로 넘어감."""
+
+
+class _OVStartError(_GPUStartError):
+    """OpenVINO(인텔 GPU) 시작 실패."""
 
 
 def ov_device():
@@ -256,6 +279,27 @@ def _ensure_ov_tokenizers(model_dir: Path) -> None:
         raise _OVStartError(f"OpenVINO 토크나이저 변환 실패: {exc}") from exc
 
 
+def _clean_stale_exports(parent: Path, max_age_s: float = 3 * 3600) -> None:
+    """변환이 중간에 강제 종료되면 models/tmpXXXX 폴더가 남아 수 GB를 차지함. 오래된 것만 지움
+    (다른 프로세스가 지금 변환 중인 폴더는 최근에 파일이 써지므로 건드리지 않음)."""
+    import shutil
+    import time
+
+    if not parent.is_dir():
+        return
+    now = time.time()
+    for d in parent.glob("tmp*"):
+        if not d.is_dir():
+            continue
+        try:
+            newest = max((f.stat().st_mtime for f in d.rglob("*")), default=d.stat().st_mtime)
+        except OSError:
+            continue
+        if now - newest > max_age_s:
+            log(f"중단된 변환 임시 폴더 정리: {d}")
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def _ensure_ov_model(repo: str, model_dir: Path) -> str:
     """Export once, then publish only the completed OpenVINO model."""
     import subprocess
@@ -267,6 +311,7 @@ def _ensure_ov_model(repo: str, model_dir: Path) -> str:
             return str(model_dir)
         log(f"[최초 1회] {repo} 를 인텔 GPU(OpenVINO) 형식으로 변환합니다.")
         model_dir.parent.mkdir(parents=True, exist_ok=True)
+        _clean_stale_exports(model_dir.parent)
         with tempfile.TemporaryDirectory(dir=model_dir.parent) as temp:
             staging = Path(temp) / "model"
             cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "openvino",
@@ -295,9 +340,11 @@ def _cut_points(wav, sr, target_s=300):
         gaps = [(a["end"] + b["start"]) / 2 / sr for a, b in zip(speech, speech[1:])]
     except Exception:  # noqa: BLE001
         gaps = []
+    # 목표 지점 앞뒤 window초 안의 조용한 틈 중 가장 가까운 곳에서 자르고, 조각은 최소 min_len초
+    window, min_len = min(30.0, target_s * 0.4), min(30.0, target_s * 0.5)
     cuts, t = [0.0], target_s
     while t < total - target_s * 0.2:
-        near = [g for g in gaps if abs(g - t) < 30 and g > cuts[-1] + 30]
+        near = [g for g in gaps if abs(g - t) < window and g > cuts[-1] + min_len]
         c = min(near, key=lambda g: abs(g - t)) if near else t
         cuts.append(c)
         t = c + target_s
@@ -331,6 +378,11 @@ def _openvino_rows(pipe, audio, lang):
 
 
 def _retry_openvino_loops(pipe, piece, sr, lang, rows):
+    return _retry_loops(lambda clip: _openvino_rows(pipe, clip, lang), piece, sr, rows)
+
+
+def _retry_loops(transcribe_clip, piece, sr, rows):
+    """같은 구절이 길게 반복된 줄만 그 구간(최대 25초)을 다시 변환. 그래도 반복이면 표시."""
     for index, (offset, text) in enumerate(rows):
         if not text:
             continue
@@ -340,7 +392,7 @@ def _retry_openvino_loops(pipe, piece, sr, lang, rows):
             clip = piece[int(offset * sr):int(end * sr)]
             if len(clip):
                 try:
-                    text = " ".join(retry for _, retry in _openvino_rows(pipe, clip, lang)).strip()
+                    text = " ".join(retry for _, retry in transcribe_clip(clip)).strip()
                 except RuntimeError as exc:
                     log(f"반복 인식 구간 재시도 실패: {exc}")
                     text = ""
@@ -388,42 +440,191 @@ def _run_whisper_openvino(audio, lang, model, gpu, on_progress, start_at):
     yield from run_whisper(audio, lang, model, gpu, on_progress, start_at)
 
 
-def run_cohere(audio, lang="ko", on_progress=None, **_):
-    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
-    from transformers.audio_utils import load_audio
+# ---------- 그 밖의 GPU: DirectML (AMD Radeon 등, Windows) ----------
+# DirectML은 DX12가 되는 GPU면 제조사와 상관없이 쓸 수 있는 Microsoft의 가속 방식.
+# 모델을 ONNX로 한 번 변환해 두고 ONNX Runtime(onnxruntime-directml)으로 실행한다.
+KO_ONNX_DIR = HERE / "models" / "batisay-ko-turbo-onnx"
+_WHISPER_ONNX_DIRS = {
+    "large-v3": HERE / "models" / "whisper-large-v3-onnx",
+    "large-v3-turbo": HERE / "models" / "whisper-large-v3-turbo-onnx",
+    "turbo": HERE / "models" / "whisper-large-v3-turbo-onnx",
+}
+ONNX_PIECE_S = 300
 
-    repo = "CohereLabs/cohere-transcribe-03-2026"
+
+def _ort_provider() -> str:
+    # 테스트·진단용으로 실행 장치를 바꿀 수 있게 (예: CPUExecutionProvider)
+    return os.environ.get("TRANSCRIBE_ORT_PROVIDER", "DmlExecutionProvider")
+
+
+def directml_available() -> bool:
+    if os.environ.get("TRANSCRIBE_NO_DIRECTML"):
+        return False
+    try:
+        import onnxruntime as ort
+        import optimum.onnxruntime  # noqa: F401  (설치돼 있어야 이 경로를 씀)
+    except Exception:  # noqa: BLE001
+        return False
+    return _ort_provider() in ort.get_available_providers()
+
+
+def ensure_onnx_model(repo: str, model_dir: Path) -> str:
+    """Hugging Face 모델을 ONNX로 한 번 변환. 임시 폴더에서 끝까지 만든 뒤에만 옮겨서 반쯤 된 폴더가 안 남음."""
+    import subprocess
+    import tempfile
+
+    done = model_dir / "encoder_model.onnx"
+    with _models_lock:
+        if done.is_file():
+            return str(model_dir)
+        log(f"[최초 1회] {repo} 를 ONNX(DirectML) 형식으로 변환합니다.")
+        model_dir.parent.mkdir(parents=True, exist_ok=True)
+        _clean_stale_exports(model_dir.parent)
+        with tempfile.TemporaryDirectory(dir=model_dir.parent) as temp:
+            staging = Path(temp) / "model"
+            cmd = [sys.executable, "-m", "optimum.commands.optimum_cli", "export", "onnx",
+                   "--model", repo, "--task", "automatic-speech-recognition-with-past", str(staging)]
+            result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+            if result.returncode != 0 or not (staging / "encoder_model.onnx").is_file():
+                raise _GPUStartError(f"{repo} ONNX 변환 실패")
+            # 변환기가 Whisper 전용 생성 설정(no_timestamps_token_id, lang_to_id 등)을 빠뜨리는 경우가 있어
+            # 원본 설정을 그대로 덮어씀. 이게 없으면 타임스탬프를 요청할 때 오류가 남.
+            try:
+                from transformers import GenerationConfig
+                GenerationConfig.from_pretrained(repo).save_pretrained(staging)
+            except Exception as exc:  # noqa: BLE001
+                raise _GPUStartError(f"{repo} 생성 설정 복사 실패: {exc}") from exc
+            try:
+                staging.rename(model_dir)
+            except FileExistsError:
+                if not done.is_file():
+                    raise _GPUStartError(f"완료되지 않은 모델 폴더가 있습니다: {model_dir}")
+        log(f"변환 완료: {model_dir}")
+        return str(model_dir)
+
+
+def _onnx_pipeline(model_dir: str):
+    import onnxruntime as ort
+    from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+    from transformers import AutoProcessor, pipeline
+
+    provider = _ort_provider()
+    key = ("onnx", model_dir, provider)
+    with _models_lock:
+        if key not in _models:
+            log(f"모델 로드 중: {model_dir} (ONNX Runtime {provider})")
+            options = ort.SessionOptions()
+            # DirectML은 메모리 패턴 최적화와 병렬 실행을 지원하지 않음
+            options.enable_mem_pattern = False
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            model = ORTModelForSpeechSeq2Seq.from_pretrained(
+                model_dir, provider=provider, session_options=options, use_io_binding=False)
+            processor = AutoProcessor.from_pretrained(model_dir)
+            _models[key] = pipeline("automatic-speech-recognition", model=model,
+                                    tokenizer=processor.tokenizer,
+                                    feature_extractor=processor.feature_extractor,
+                                    chunk_length_s=30)
+        return _models[key]
+
+
+def _onnx_rows(pipe, audio, lang):
+    out = pipe({"raw": audio, "sampling_rate": SR}, return_timestamps=True,
+               generate_kwargs={"language": lang, "task": "transcribe"})
+    rows = [((c.get("timestamp") or (0.0, None))[0] or 0.0, c["text"].strip())
+            for c in out.get("chunks") or [] if c["text"].strip()]
+    if not rows and out.get("text", "").strip():
+        rows = [(0.0, out["text"].strip())]
+    return rows
+
+
+def run_onnx(audio, model_dir, lang="ko", on_progress=None, start_at=0.0):
+    try:
+        pipe = _onnx_pipeline(model_dir)
+        wav, total = _decode_from(audio, start_at)
+    except Exception as e:  # noqa: BLE001
+        raise _GPUStartError(f"{type(e).__name__}: {e}") from e
+    cuts = _cut_points(wav, SR, target_s=ONNX_PIECE_S)
+    for a, b in zip(cuts, cuts[1:]):
+        piece = wav[int(a * SR):int(b * SR)]
+        rows = _onnx_rows(pipe, piece, lang)
+        for offset, text in _retry_loops(lambda clip: _onnx_rows(pipe, clip, lang), piece, SR, rows):
+            yield start_at + a + offset, text
+        if on_progress and total:
+            on_progress(min((start_at + b) / total, 1.0))
+
+
+def _run_whisper_onnx(audio, lang, model, gpu, on_progress, start_at):
+    repo_model = "large-v3-turbo" if model == "turbo" else model
+    try:
+        model_dir = ensure_onnx_model(f"openai/whisper-{repo_model}", _WHISPER_ONNX_DIRS[model])
+        yield from run_onnx(audio, model_dir, lang, on_progress=on_progress, start_at=start_at)
+        return
+    except _GPUStartError as exc:
+        log(f"{model} DirectML 시작 실패, CPU로 전환: {exc}")
+    yield from run_whisper(audio, lang, model, gpu, on_progress, start_at)
+
+
+COHERE_REPO = "CohereLabs/cohere-transcribe-03-2026"
+COHERE_PIECE_S = 20      # Cohere는 타임스탬프를 안 줘서, 이 길이로 잘라 조각 시작 시각을 타임스탬프로 씀
+COHERE_BATCH = 4
+
+
+def _cohere_model():
+    from transformers import AutoProcessor, CohereAsrForConditionalGeneration
+
     with _models_lock:
         if "cohere" not in _models:
             log("모델 로드 중: Cohere Transcribe")
             _models["cohere"] = (
-                AutoProcessor.from_pretrained(repo),
-                CohereAsrForConditionalGeneration.from_pretrained(repo, device_map="auto"),
+                AutoProcessor.from_pretrained(COHERE_REPO),
+                CohereAsrForConditionalGeneration.from_pretrained(COHERE_REPO, device_map="auto"),
             )
-    processor, model = _models["cohere"]
+        return _models["cohere"]
 
-    wav = load_audio(audio, sampling_rate=16000)
-    inputs = processor(wav, sampling_rate=16000, return_tensors="pt", language=lang)
-    # 긴 녹음은 processor가 자동으로 잘라주고, 이 인덱스로 다시 이어붙임
+
+def _cohere_texts(processor, model, pieces, lang):
+    """여러 조각을 한 번에 변환해 조각별 텍스트 목록을 돌려줌."""
+    inputs = processor(pieces if len(pieces) > 1 else pieces[0], sampling_rate=SR,
+                       return_tensors="pt", language=lang)
+    # 조각이 모델 한도보다 길면 processor가 다시 잘라 주고, 이 인덱스로 이어 붙임
     chunk_index = inputs.pop("audio_chunk_index", None)
     inputs = inputs.to(model.device, dtype=model.dtype)
-
     outputs = model.generate(**inputs, max_new_tokens=256)
     if chunk_index is not None:
-        text = processor.decode(
-            outputs, skip_special_tokens=True,
-            audio_chunk_index=chunk_index, language=lang,
-        )[0]
+        texts = processor.decode(outputs, skip_special_tokens=True,
+                                 audio_chunk_index=chunk_index, language=lang)
     else:
-        text = processor.decode(outputs, skip_special_tokens=True)
-        if isinstance(text, list):
-            text = text[0]
-    if on_progress:
-        on_progress(1.0)
-    # 타임스탬프가 없으니 문장 단위로만 줄바꿈
-    for sent in text.replace(". ", ".\n").replace("? ", "?\n").splitlines():
-        if sent.strip():
-            yield None, sent.strip()
+        texts = processor.decode(outputs, skip_special_tokens=True)
+    if isinstance(texts, str):
+        texts = [texts]
+    return [t.strip() for t in texts]
+
+
+def _split_in_half(piece):
+    """반복 인식이 난 조각을 조용한 틈(없으면 가운데)에서 둘로 나눔."""
+    cuts = _cut_points(piece, SR, target_s=len(piece) / SR / 2)
+    mid = cuts[1] if len(cuts) > 2 else len(piece) / SR / 2
+    return piece[:int(mid * SR)], piece[int(mid * SR):]
+
+
+def run_cohere(audio, lang="ko", on_progress=None, start_at=0.0, **_):
+    processor, model = _cohere_model()
+    wav, total = _decode_from(audio, start_at)
+    cuts = _cut_points(wav, SR, target_s=COHERE_PIECE_S)
+    spans = list(zip(cuts, cuts[1:]))
+    for i in range(0, len(spans), COHERE_BATCH):
+        batch = spans[i:i + COHERE_BATCH]
+        pieces = [wav[int(a * SR):int(b * SR)] for a, b in batch]
+        for (a, b), piece, text in zip(batch, pieces, _cohere_texts(processor, model, pieces, lang)):
+            if _has_transcription_loop(text):
+                # 반복 인식이 나면 조각을 반으로 나눠 다시 시도
+                halves = [h for h in _split_in_half(piece) if len(h)]
+                retry = " ".join(_cohere_texts(processor, model, halves, lang)) if halves else ""
+                text = retry if retry and not _has_transcription_loop(retry) else LOOP_MARKER
+            if text:
+                yield start_at + a, text
+        if on_progress and total:
+            on_progress(min((start_at + batch[-1][1]) / total, 1.0))
 
 
 def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, on_progress=None,
@@ -432,32 +633,96 @@ def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, 
     if engine == "ko":
         return run_ko(audio, gpu=gpu, on_progress=on_progress, start_at=start_at)
     if engine == "whisper":
-        if model in _WHISPER_OV_DIRS and gpu is not False and not cuda_available() and intel_gpu_available():
+        backend = gpu_backend(gpu) if model in _WHISPER_OV_DIRS else "other"
+        if backend == "openvino":
             return _run_whisper_openvino(audio, lang, model, gpu, on_progress, start_at)
+        if backend == "directml":
+            return _run_whisper_onnx(audio, lang, model, gpu, on_progress, start_at)
         return run_whisper(audio, lang, model, gpu, on_progress, start_at)
     if engine == "cohere":
-        return run_cohere(audio, lang, on_progress=on_progress)
+        return run_cohere(audio, lang, on_progress=on_progress, start_at=start_at)
     raise ValueError(f"알 수 없는 엔진: {engine} (가능: {', '.join(ENGINES)})")
 
 
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 
 
-def output_path(audio, engine, model=DEFAULT_WHISPER_MODEL) -> Path:
-    """결과 파일 경로. whisper는 모델마다 결과가 달라서 기본 모델(turbo)이 아니면 모델 이름을 붙임.
-    예: 강의.ko.txt, 강의.whisper.txt(turbo), 강의.whisper.large-v3.txt, 강의.whisper.small.txt"""
+# ---------- 결과 저장 위치 ----------
+# 결과는 원본 옆이 아니라 한 곳에 모음: <출력 폴더>/<녹음·노트 이름>/
+# 출력 폴더는 환경 변수 TRANSCRIBE_OUTPUT_DIR > 설치 폴더의 config.json {"output_dir": ...} > <설치 폴더>/output
+def output_root() -> Path:
+    env = os.environ.get("TRANSCRIBE_OUTPUT_DIR")
+    if env:
+        return Path(env).expanduser()
+    cfg = HERE / "config.json"
+    if cfg.is_file():
+        try:
+            import json
+            value = json.loads(cfg.read_text(encoding="utf-8")).get("output_dir")
+            if value:
+                return Path(value).expanduser()
+        except (ValueError, OSError) as exc:
+            log(f"config.json을 읽지 못해 기본 출력 폴더를 써요: {exc}")
+    return HERE / "output"
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def work_dir(source, create: bool = False) -> Path:
+    """녹음·노트 하나의 결과를 모으는 폴더. 이미 출력 폴더 안에 있는 파일(노트에서 꺼낸 녹음 등)은
+    그 파일이 있는 폴더를 그대로 씀. 이름이 같은 다른 파일과는 source.txt로 구분해 겹치지 않게 함."""
+    src = Path(source).resolve()
+    root = output_root()
+    if _is_within(src, root):
+        return src.parent
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", src.stem).strip(" .") or "recording"
+    d = root / name
+    marker = d / "source.txt"
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() != str(src):
+        import hashlib
+        d = root / f"{name}_{hashlib.sha1(str(src).encode('utf-8')).hexdigest()[:6]}"
+        marker = d / "source.txt"
+    if create and not marker.is_file():
+        d.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(src), encoding="utf-8")
+    return d
+
+
+def _result_suffix(engine, model) -> str:
+    """whisper는 모델마다 결과가 달라서 기본 모델(turbo)이 아니면 모델 이름을 붙임."""
     if engine == "whisper" and model not in (DEFAULT_WHISPER_MODEL, "turbo"):
         safe = re.sub(r"[^\w.\-]+", "_", Path(str(model)).name) or "custom"
-        return Path(audio).with_suffix(f".whisper.{safe}.txt")
-    return Path(audio).with_suffix(f".{engine}.txt")
+        return f".whisper.{safe}.txt"
+    return f".{engine}.txt"
+
+
+def output_path(audio, engine, model=DEFAULT_WHISPER_MODEL) -> Path:
+    """결과 파일 경로. 예: output/강의/강의.ko.txt, 강의.whisper.txt(turbo), 강의.whisper.large-v3.txt"""
+    return work_dir(audio) / (Path(audio).stem + _result_suffix(engine, model))
+
+
+def _legacy_output_path(audio, engine, model) -> Path:
+    """예전 버전처럼 원본 옆에 저장된 결과."""
+    return Path(audio).with_suffix(_result_suffix(engine, model))
 
 
 def finished_outputs(audio) -> list[str]:
     """이 녹음에 대해 이미 끝난 변환 결과 이름들 (예: ['ko', 'whisper', 'whisper.large-v3'])."""
     audio = Path(audio)
     prefix = audio.stem + "."
-    return sorted(p.name[len(prefix):-len(".txt")] for p in audio.parent.glob(f"{glob.escape(audio.stem)}.*.txt")
-                  if p.name[len(prefix):-len(".txt")].split(".")[0] in ENGINES)
+    found = set()
+    for folder in {work_dir(audio), audio.parent}:   # 새 위치 + 예전 위치(원본 옆)
+        for p in folder.glob(f"{glob.escape(audio.stem)}.*.txt"):
+            name = p.name[len(prefix):-len(".txt")]
+            if name.split(".")[0] in ENGINES:
+                found.add(name)
+    return sorted(found)
 
 
 def format_line(start, text) -> str:
@@ -485,13 +750,20 @@ def _resume_point(part: Path):
 
 def transcribe_to_file(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None,
                        on_progress=None, echo=False, *, force=False) -> Path:
-    """녹음을 <이름>.<engine>.txt로 변환. 중간에 끊겨도 다음 실행 때 끊긴 지점부터 이어서 함.
+    """녹음을 <출력 폴더>/<이름>/<이름>.<engine>.txt로 변환. 중간에 끊겨도 다음 실행 때 끊긴 지점부터 이어서 함.
     변환 중에는 <이름>.<engine>.txt.part에 한 줄씩 바로 저장하고, 끝까지 성공하면 이름을 바꿈."""
+    work_dir(audio, create=True)
     out = output_path(audio, engine, model)
     if out.exists() and not force:
         return out
+    legacy = _legacy_output_path(audio, engine, model)
+    if legacy.is_file() and not force and legacy != out:
+        # 예전 버전이 원본 옆에 만든 결과는 새 위치로 복사해서 그대로 씀
+        import shutil
+        shutil.copy2(legacy, out)
+        return out
     part = out.with_suffix(out.suffix + ".part")
-    start_at = _resume_point(part) if not force and engine != "cohere" else 0.0  # cohere는 타임스탬프가 없어 처음부터
+    start_at = _resume_point(part) if not force else 0.0
     if start_at:
         log(f"이어서 변환: {fmt(start_at)}부터")
     with part.open("a" if start_at else "w", encoding="utf-8") as f:
@@ -505,6 +777,98 @@ def transcribe_to_file(audio, engine="ko", lang="ko", model="large-v3-turbo", gp
     return out
 
 
+# ---------- 자가 진단 ----------
+def _version(mod):
+    try:
+        import importlib.metadata as md
+        return md.version(mod)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _dir_size_gb(d: Path) -> float:
+    return sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9
+
+
+def doctor(run_test: bool = True) -> str:
+    """설치·장치 상태를 점검하고, 고른 가속 방식으로 실제로 짧은 변환을 돌려 확인."""
+    import platform
+    import tempfile
+    import time
+    import wave
+
+    lines = [f"Python {platform.python_version()} · {platform.system()} {platform.release()} ({platform.machine()})"]
+    pkgs = ["faster-whisper", "ctranslate2", "av", "openvino", "openvino-genai", "onnxruntime",
+            "onnxruntime-directml", "optimum", "optimum-intel", "optimum-onnx", "transformers", "torch"]
+    lines.append("패키지: " + ", ".join(f"{p} {v}" for p in pkgs if (v := _version(p))))
+
+    cuda = cuda_available()
+    ov = ov_device()
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+    except Exception:  # noqa: BLE001
+        providers = []
+    lines += [
+        f"NVIDIA CUDA: {'있음' if cuda else '없음'}",
+        f"인텔 GPU(OpenVINO): {ov or '없음'}",
+        f"ONNX Runtime 실행 장치: {', '.join(providers) or '없음'}"
+        + (" → DirectML 사용 가능" if directml_available() else ""),
+    ]
+    backend = gpu_backend(None)
+    lines.append(f"자동 선택: {backend}")
+    lines.append(f"결과 저장 폴더: {output_root()}")
+
+    models = {"ko (CPU·CUDA)": KO_DIR, "ko (인텔 GPU)": KO_OV_DIR, "ko (DirectML)": KO_ONNX_DIR,
+              "large-v3 (인텔 GPU)": LARGE_V3_OV_DIR, "large-v3-turbo (인텔 GPU)": LARGE_V3_TURBO_OV_DIR,
+              "large-v3 (DirectML)": _WHISPER_ONNX_DIRS["large-v3"],
+              "large-v3-turbo (DirectML)": _WHISPER_ONNX_DIRS["large-v3-turbo"]}
+    ready = [name for name, d in models.items() if d.is_dir() and any(d.iterdir())]
+    lines.append("준비된 모델: " + (", ".join(ready) or "없음"))
+    stale = [d for d in (HERE / "models").glob("tmp*") if d.is_dir()] if (HERE / "models").is_dir() else []
+    if stale:
+        lines.append(f"중단된 변환 임시 폴더 {len(stale)}개 ({sum(map(_dir_size_gb, stale)):.1f}GB) — 다음 변환 때 3시간 지난 것은 자동 정리")
+
+    if not run_test:
+        return "\n".join(lines)
+
+    need = {"cuda": KO_DIR, "openvino": KO_OV_DIR, "directml": KO_ONNX_DIR, "cpu": KO_DIR}[backend]
+    if not need.is_dir():
+        lines.append(f"실행 확인: 건너뜀 — {backend}용 한국어 모델이 아직 준비되지 않았어요 (install.py 또는 setup.bat 실행)")
+        return "\n".join(lines)
+
+    # 10초짜리 시험 음성(조용한 구간 + 짧은 소리)으로 실제 경로를 한 번 돌려 봄
+    import numpy as np
+
+    t = np.arange(10 * SR) / SR
+    sig = (0.2 * np.sin(2 * np.pi * 220 * t) * ((t % 2) < 1)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = Path(tmp) / "check.wav"
+        with wave.open(str(wav_path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes((sig * 32767).astype("<i2").tobytes())
+        start = time.time()
+        try:
+            if backend == "openvino":
+                list(run_openvino(str(wav_path), str(KO_OV_DIR), "ko"))
+                where = f"OpenVINO {ov}"
+            elif backend == "directml":
+                list(run_onnx(str(wav_path), str(KO_ONNX_DIR), "ko"))
+                pipe = _models[("onnx", str(KO_ONNX_DIR), _ort_provider())]
+                where = "ONNX Runtime " + ", ".join(getattr(pipe.model, "providers", []) or [_ort_provider()])
+            else:
+                list(run_whisper(str(wav_path), "ko", str(KO_DIR), backend == "cuda"))
+                m = next(v for k, v in _models.items() if k[0] == "fw")
+                where = f"faster-whisper {m.model.device}"
+            lines.append(f"실행 확인: 성공 — {where}에서 10초 시험 음성을 {time.time() - start:.1f}초에 처리")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"실행 확인: 실패 ({backend}) — {type(exc).__name__}: {exc}\n"
+                         "  → 실제 변환에서는 CPU로 자동 전환돼요. 드라이버·설치 옵션을 확인하세요.")
+    return "\n".join(lines)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("audio", nargs="?", help="mp3, m4a, wav, mp4 등")
@@ -514,13 +878,17 @@ def main():
     p.add_argument("--lang", default="ko")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--gpu", dest="gpu", action="store_const", const=True,
-                   help="GPU 사용 (NVIDIA CUDA, 지원 모델은 Intel OpenVINO)")
+                   help="GPU 사용 (NVIDIA CUDA, 지원 모델은 Intel OpenVINO·DirectML)")
     g.add_argument("--cpu", dest="gpu", action="store_const", const=False, help="CPU 강제 사용")
     p.add_argument("--force", action="store_true", help="이미 변환된 결과가 있어도 처음부터 다시")
     p.add_argument("--choose-model", action="store_true", help="녹음과 음성 인식 모델을 직접 선택")
+    p.add_argument("--doctor", action="store_true", help="설치·GPU 상태 점검 (짧은 시험 변환 포함)")
     p.set_defaults(gpu=None)
     a = p.parse_args()
 
+    if a.doctor:
+        print(doctor(run_test=True))
+        return
     if a.choose_model:
         if a.audio is None:
             a.audio = input("녹음 파일 경로를 붙여넣으세요: ").strip().strip('"')

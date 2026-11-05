@@ -49,7 +49,7 @@ mcp = FastMCP(
         "2) 기다리는 동안 read_pdf_text로 슬라이드 내용 파악, "
         "3) get_transcription(timestamps=true)으로 강의 녹취 전체를 받음(offset으로 끝까지), "
         "4) 슬라이드 순서를 뼈대로 교수님 설명을 녹여 교재처럼 풀어 쓴 한국어 마크다운 원고 작성, "
-        "5) save_book으로 저장하고 저장 경로를 알려주세요.\n"
+        "5) save_book으로 prepare_lecture_note가 알려 준 정리본 폴더에 저장하고 경로를 알려주세요.\n"
         "원고 규칙: '# 제목' 하나, 슬라이드 묶음마다 '## 장', 세부는 '###'. 녹취의 말투·반복·잡담은 걷어내고 문어체로. "
         "교수님이 강조한 말(중요하다, 시험, 꼭 기억, 반복 설명 등)이 붙은 내용은 '==형광펜==', 핵심 용어는 '**굵게**', "
         "시험 포인트는 '> **시험 포인트** ...' 인용 블록으로 표시. 슬라이드에 없지만 말로만 한 설명도 빠뜨리지 말고, "
@@ -255,7 +255,14 @@ async def get_transcription(job_id: str, wait_seconds: int = 40, timestamps: boo
     return _status_text(job, timestamps, max(0, offset), max(1000, max_chars))
 
 
-allowed_out: set[Path] = set()  # save_book이 쓸 수 있는 폴더 (처리한 노트가 있는 곳만)
+allowed_out: set[Path] = set()  # save_book이 쓸 수 있는 폴더 (출력 폴더 밖이라도 이번에 처리한 노트의 정리본 폴더)
+
+
+def _book_dir(source: Path) -> Path:
+    """노트·PDF의 정리본 폴더: <출력 폴더>/<노트 이름>/정리본"""
+    d = tr.work_dir(source, create=True) / "정리본"
+    _remember_dir(d)
+    return d
 
 
 def _remember_dir(d: Path):
@@ -275,9 +282,12 @@ def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko
         return f"파일이 없어요: {path}  (find_recordings로 경로를 확인하세요)"
 
     ext = path.suffix.lower()
+    if ext not in (".sdocx", ".pdf"):
+        return "prepare_lecture_note는 .sdocx나 .pdf를 받아요. 녹음만 있으면 start_transcription을 쓰세요."
+    book_dir = _book_dir(path)
     if ext == ".sdocx":
         try:
-            info = lt.extract_note(path)
+            info = lt.extract_note(path, tr.work_dir(path, create=True) / "추출")
         except Exception as e:  # noqa: BLE001
             return f"노트를 풀지 못했어요: {type(e).__name__}: {e}"
         out_dir, audios, pdfs = info["dir"], info["audio"], info["pdf"]
@@ -288,11 +298,7 @@ def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko
         audios = [f for f in path.parent.iterdir()
                   if f.suffix.lower() in AUDIO_EXTS and key and key in re.sub(r"\W+", "", f.stem.lower())]
         lines = [f"폴더: {out_dir}"]
-    else:
-        return "prepare_lecture_note는 .sdocx나 .pdf를 받아요. 녹음만 있으면 start_transcription을 쓰세요."
-
-    _remember_dir(out_dir)
-    _remember_dir(path.parent)
+    lines.append(f"정리본 저장 폴더(save_book의 folder): {book_dir}")
 
     for p in pdfs:
         try:
@@ -330,7 +336,7 @@ def read_pdf_text(pdf_path: str, pages: str = "", max_chars: int = 40000) -> str
         return "pypdf가 설치돼 있지 않아요. setup.bat을 다시 실행해주세요."
     except Exception as e:  # noqa: BLE001
         return f"PDF를 읽지 못했어요: {type(e).__name__}: {e}"
-    _remember_dir(path.parent)
+    _book_dir(path)
     cut = len(text) > max_chars
     return (f"총 {n}쪽\n" + text[:max_chars]
             + ("\n\n(잘림 — pages를 좁혀서 다시 호출하세요)" if cut else ""))
@@ -339,13 +345,13 @@ def read_pdf_text(pdf_path: str, pages: str = "", max_chars: int = 40000) -> str
 @mcp.tool()
 def save_book(folder: str, title: str, markdown: str) -> str:
     """Claude가 쓴 책 원고(마크다운)를 저장합니다. '==텍스트=='는 형광펜으로 표시됩니다.
-    folder는 prepare_lecture_note/read_pdf_text로 다룬 노트의 폴더여야 합니다.
+    folder는 prepare_lecture_note가 알려 준 '정리본 저장 폴더'를 쓰세요 (출력 폴더 안이면 어디든 가능).
     <제목>.md 와 브라우저로 열어 보거나 PDF로 인쇄하기 좋은 <제목>.html 을 만듭니다."""
     d = _clean_path(folder).resolve()
-    if d not in allowed_out:
-        return ("이 폴더에는 저장할 수 없어요. 처리한 노트가 있는 폴더 중 하나를 쓰세요: "
-                + ", ".join(map(str, sorted(allowed_out))) if allowed_out else
-                "먼저 prepare_lecture_note나 read_pdf_text로 노트를 처리하세요.")
+    if d not in allowed_out and not tr._is_within(d, tr.output_root()):
+        return (f"이 폴더에는 저장할 수 없어요. 출력 폴더({tr.output_root()}) 안이나 "
+                "prepare_lecture_note가 알려 준 정리본 폴더를 쓰세요.")
+    d.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r'[\\/:*?"<>|]', "_", title).strip()[:80] or "강의노트"
     md_path, html_path = d / f"{safe}.md", d / f"{safe}.html"
     md_path.write_text(markdown, encoding="utf-8")
@@ -355,6 +361,14 @@ def save_book(folder: str, title: str, markdown: str) -> str:
         return f"원고는 저장했어요: {md_path}\nHTML 변환용 markdown 패키지가 없어요. setup.bat을 다시 실행해주세요."
     return (f"저장 완료\n- 책(브라우저로 열기, Ctrl+P로 PDF 저장 가능): {html_path}\n- 원고: {md_path}\n"
             f"- 형광펜 {markdown.count('==') // 2}곳, 시험 포인트 {markdown.count('시험 포인트')}곳")
+
+
+@mcp.tool()
+def check_setup(run_test: bool = True) -> str:
+    """설치·GPU 상태를 점검합니다. 어떤 가속(NVIDIA CUDA / 인텔 OpenVINO / DirectML / CPU)이 선택되는지,
+    모델이 준비됐는지 보여 주고, run_test=true면 10초 시험 음성으로 그 경로가 실제로 도는지 확인합니다.
+    변환이 느리거나 GPU를 안 쓰는 것 같을 때 먼저 호출하세요."""
+    return tr.doctor(run_test=run_test)
 
 
 if __name__ == "__main__":
