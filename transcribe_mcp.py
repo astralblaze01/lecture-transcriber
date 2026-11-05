@@ -70,25 +70,17 @@ def _worker():
         job = jobs[jid]
         job["status"] = "running"
         job["started"] = time.time()
-        out = tr.output_path(job["file"], job["engine"])
-        part = out.with_suffix(out.suffix + ".part")
         try:
             def on_progress(p):
                 job["progress"] = p
 
-            with part.open("w", encoding="utf-8") as f:
-                for start, text in tr.transcribe(job["file"], job["engine"], job["language"],
-                                                 job["model"], job["gpu"], on_progress):
-                    f.write(tr.format_line(start, text) + "\n")
-                    f.flush()
-            part.replace(out)  # 끝까지 성공한 결과만 캐시로 남김
+            # 중간에 끊긴 .part가 있으면 그 지점부터 이어서 함. 실패해도 .part는 남겨 다음에 이어감.
+            out = tr.transcribe_to_file(job["file"], job["engine"], job["language"],
+                                        job["model"], job["gpu"], on_progress)
             job.update(status="done", progress=1.0, output=str(out), finished=time.time())
         except Exception as e:  # noqa: BLE001
-            job.update(status="error", error=f"{type(e).__name__}: {e}", finished=time.time())
-            try:
-                part.unlink(missing_ok=True)
-            except OSError:
-                pass
+            job.update(status="error", error=f"{type(e).__name__}: {e} (다시 시작하면 끊긴 지점부터 이어서 해요)",
+                       finished=time.time())
         finally:
             job_queue.task_done()
 

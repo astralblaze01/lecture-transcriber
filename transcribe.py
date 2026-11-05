@@ -21,6 +21,7 @@ cohere 엔진은 추가 설치가 필요해요:
 """
 import argparse
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -144,25 +145,39 @@ def ensure_ko_model():
 # 모든 엔진은 (시작초 또는 None, 텍스트)를 yield 하고,
 # on_progress(0~1)를 받으면 진행률을 알려줌.
 
-def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=None, on_progress=None):
+SR = 16000
+
+
+def _decode_from(audio, start_at):
+    """start_at초부터의 오디오(16kHz float32)와 전체 길이(초)."""
+    from faster_whisper.audio import decode_audio
+    wav = decode_audio(audio, sampling_rate=SR)
+    return wav[int(start_at * SR):], len(wav) / SR
+
+
+def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=None, on_progress=None, start_at=0.0):
     m = _whisper_model(model, gpu)
+    total = None
+    if start_at:
+        audio, total = _decode_from(audio, start_at)
     segments, info = m.transcribe(audio, language=lang, vad_filter=True)
-    total = info.duration or 0
+    total = total or info.duration or 0
     for seg in segments:
         if on_progress and total:
-            on_progress(min(seg.end / total, 1.0))
-        yield seg.start, seg.text.strip()
+            on_progress(min((start_at + seg.end) / total, 1.0))
+        yield start_at + seg.start, seg.text.strip()
 
 
-def run_ko(audio, gpu=None, on_progress=None, **_):
+def run_ko(audio, gpu=None, on_progress=None, start_at=0.0, **_):
     # 자동 모드: NVIDIA(CUDA) → 인텔 GPU(OpenVINO) → CPU 순서
     if gpu is not False and not cuda_available() and intel_gpu_available():
         try:
-            yield from run_openvino(audio, ensure_ko_ov_model(), "ko", on_progress=on_progress)
+            yield from run_openvino(audio, ensure_ko_ov_model(), "ko", on_progress=on_progress,
+                                    start_at=start_at)
             return
         except _OVStartError as e:
             log(f"인텔 GPU로 시작하지 못해 CPU로 바꿔요: {e}")
-    yield from run_whisper(audio, "ko", ensure_ko_model(), gpu, on_progress)
+    yield from run_whisper(audio, "ko", ensure_ko_model(), gpu, on_progress, start_at)
 
 
 # ---------- 인텔 GPU (OpenVINO) ----------
@@ -231,7 +246,7 @@ def _cut_points(wav, sr, target_s=300):
     return cuts
 
 
-def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None):
+def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None, start_at=0.0):
     try:
         import openvino_genai as ovg
         from faster_whisper.audio import decode_audio
@@ -243,13 +258,13 @@ def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None):
                 Pipe = getattr(ovg, "ASRPipeline", None) or ovg.WhisperPipeline
                 _models[key] = Pipe(model_dir, device)
         pipe = _models[key]
-        sr = 16000
-        wav = decode_audio(audio, sampling_rate=sr)
+        sr = SR
+        wav, full = _decode_from(audio, start_at)
     except Exception as e:  # noqa: BLE001
         raise _OVStartError(f"{type(e).__name__}: {e}") from e
 
     cuts = _cut_points(wav, sr)
-    total = cuts[-1]
+    total = full
     for a, b in zip(cuts, cuts[1:]):
         piece = wav[int(a * sr):int(b * sr)]
         res = pipe.generate(piece.tolist(), language=f"<|{lang}|>", task="transcribe",
@@ -259,13 +274,13 @@ def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None):
             for ch in chunks:
                 text = ch.text.strip()
                 if text:
-                    yield a + max(ch.start_ts, 0.0), text
+                    yield start_at + a + max(ch.start_ts, 0.0), text
         else:
             text = (res.texts[0] if getattr(res, "texts", None) else str(res)).strip()
             if text:
-                yield a, text
+                yield start_at + a, text
         if on_progress and total:
-            on_progress(min(b / total, 1.0))
+            on_progress(min((start_at + b) / total, 1.0))
 
 
 def run_cohere(audio, lang="ko", on_progress=None, **_):
@@ -306,12 +321,13 @@ def run_cohere(audio, lang="ko", on_progress=None, **_):
             yield None, sent.strip()
 
 
-def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, on_progress=None):
-    """엔진을 골라 (시작초, 텍스트)를 차례로 돌려줌."""
+def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, on_progress=None,
+               start_at=0.0):
+    """엔진을 골라 (시작초, 텍스트)를 차례로 돌려줌. start_at초부터 시작할 수 있음(이어하기용)."""
     if engine == "ko":
-        return run_ko(audio, gpu=gpu, on_progress=on_progress)
+        return run_ko(audio, gpu=gpu, on_progress=on_progress, start_at=start_at)
     if engine == "whisper":
-        return run_whisper(audio, lang, model, gpu, on_progress)
+        return run_whisper(audio, lang, model, gpu, on_progress, start_at)
     if engine == "cohere":
         return run_cohere(audio, lang, on_progress=on_progress)
     raise ValueError(f"알 수 없는 엔진: {engine} (가능: {', '.join(ENGINES)})")
@@ -325,6 +341,47 @@ def format_line(start, text) -> str:
     return f"[{fmt(start)}] {text}" if start is not None else text
 
 
+_TS = re.compile(r"^\[(\d+):(\d\d):(\d\d)\] ")
+
+
+def _resume_point(part: Path):
+    """중단된 .part 파일에서 이어 시작할 시점(초). 마지막 줄은 덜 써졌을 수 있어 버리고 그 줄 시작부터 다시."""
+    if not part.exists():
+        return 0.0
+    lines = part.read_text(encoding="utf-8", errors="replace").splitlines()
+    stamps = [(i, _TS.match(l)) for i, l in enumerate(lines)]
+    stamps = [(i, m) for i, m in stamps if m]
+    if not stamps:
+        part.unlink()
+        return 0.0
+    i, m = stamps[-1]
+    h, mi, s = map(int, m.groups())
+    part.write_text("".join(l + "\n" for l in lines[:i]), encoding="utf-8")
+    return float(h * 3600 + mi * 60 + s)
+
+
+def transcribe_to_file(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None,
+                       on_progress=None, echo=False) -> Path:
+    """녹음을 <이름>.<engine>.txt로 변환. 중간에 끊겨도 다음 실행 때 끊긴 지점부터 이어서 함.
+    변환 중에는 <이름>.<engine>.txt.part에 한 줄씩 바로 저장하고, 끝까지 성공하면 이름을 바꿈."""
+    out = output_path(audio, engine)
+    if out.exists():
+        return out
+    part = out.with_suffix(out.suffix + ".part")
+    start_at = _resume_point(part) if engine != "cohere" else 0.0  # cohere는 타임스탬프가 없어 처음부터
+    if start_at:
+        log(f"이어서 변환: {fmt(start_at)}부터")
+    with part.open("a" if start_at else "w", encoding="utf-8") as f:
+        for start, text in transcribe(audio, engine, lang, model, gpu, on_progress, start_at):
+            line = format_line(start, text)
+            if echo:
+                print(line, flush=True)
+            f.write(line + "\n")
+            f.flush()  # 강제 종료돼도 여기까지는 남음
+    part.replace(out)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("audio", help="mp3, m4a, wav, mp4 등")
@@ -336,15 +393,17 @@ def main():
     g.add_argument("--gpu", dest="gpu", action="store_const", const=True,
                    help="NVIDIA GPU 강제 사용 (기본: 있으면 자동으로 GPU)")
     g.add_argument("--cpu", dest="gpu", action="store_const", const=False, help="CPU 강제 사용")
+    p.add_argument("--force", action="store_true", help="이미 변환된 결과가 있어도 처음부터 다시")
     p.set_defaults(gpu=None)
     a = p.parse_args()
 
     out = output_path(a.audio, a.engine)
-    with out.open("w", encoding="utf-8") as f:
-        for start, text in transcribe(a.audio, a.engine, a.lang, a.model, a.gpu):
-            line = format_line(start, text)
-            print(line)
-            f.write(line + "\n")
+    if out.exists() and a.force:
+        out.unlink()
+    if out.exists():
+        print(f"이미 변환돼 있어요: {out}  (다시 하려면 --force)")
+        return
+    out = transcribe_to_file(a.audio, a.engine, a.lang, a.model, a.gpu, echo=True)
     print(f"\n저장 완료: {out}")
 
 
