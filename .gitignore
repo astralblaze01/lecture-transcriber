@@ -17,3 +17,4 @@ __pycache__/
 config.json
 models/
 output/
+.venv-export/

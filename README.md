@@ -8,18 +8,18 @@
 
 ## 모델 직접 선택
 
-공통 실행 옵션 `--choose-model`을 사용하면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo, Qwen3-ASR 1.7B 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
+공통 실행 옵션 `--choose-model`을 사용하면 한국어 특화 BatiSay Turbo, Qwen3-ASR 1.7B, Cohere Transcribe 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. 결과는 엔진마다 `녹음.ko.txt`, `녹음.qwen.txt`처럼 따로 저장됩니다.
 
-Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. `large-v3`는 `engine="whisper", model="large-v3"`로 전달됩니다.
+Claude에서는 “Qwen으로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. Qwen은 `engine="qwen"`으로 전달됩니다.
 
 ## 기능
 
-- **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe, Qwen3-ASR 중 선택 ([변환 엔진](#변환-엔진) 참고)
+- **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), Qwen3-ASR, Cohere Transcribe 중 선택 ([변환 엔진](#변환-엔진) 참고)
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
 - **이어하기**: 변환 중 한 줄씩 `.part`에 바로 저장해서, 중간에 꺼도 다음 실행 때 끊긴 지점부터 이어서 변환
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
 - **책 만들기**: 슬라이드 순서를 뼈대로 강의 설명을 풀어 쓴 문서를 `.html`(인쇄용 스타일)과 `.md`로 저장. 강조한 내용은 형광펜, 시험 포인트는 박스로 표시
-- **GPU 가속** · Apple Silicon Mac은 MLX, NVIDIA는 CUDA, 인텔 GPU는 OpenVINO, AMD 등은 DirectML로 자동 실행합니다. 없으면 CPU(int8).
+- **GPU 가속** · Apple Silicon Mac은 MLX, NVIDIA는 CUDA, 인텔 GPU는 OpenVINO로 자동 실행합니다. 없으면 CPU.
 - **반복 인식 완화** · 같은 단어나 구절이 길게 반복되면(MLX, OpenVINO, faster-whisper 모두) 해당 구간만 다시 변환하고, 복구하지 못한 구간은 `[반복 인식 오류 · 재변환으로 복구하지 못함]`으로 표시합니다.
 
 ## 변환 엔진
@@ -29,9 +29,8 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 | 엔진 | 모델 | 실행기 | 노트북 CPU | 이럴 때 |
 |---|---|---|---|---|
 | `ko` (기본) | [batiai/batisay-ko-turbo](https://huggingface.co/batiai/batisay-ko-turbo) — Whisper large-v3-turbo를 한국어로 파인튜닝 | faster-whisper (int8) | 빠름 | 한국어 강의·회의 |
-| `whisper` | OpenAI Whisper (`--model`로 `large-v3`, `large-v3-turbo` 등 선택) | faster-whisper (int8) | 빠름 | 영어 등 다른 언어, 여러 언어가 섞인 녹음 |
 | `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 |
-| `qwen` | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — 52개 언어·방언, 노래·배경음악 섞인 음성도 인식 | transformers (Apple Silicon은 mlx-audio) | 보통 (1.7B, float32) | 여러 언어가 섞였거나 Whisper 결과가 아쉬울 때 |
+| `qwen` | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — 52개 언어·방언, 노래·배경음악 섞인 음성도 인식 | transformers (Apple Silicon은 mlx-audio) | 보통 (1.7B, float32) | 영어 등 다른 언어, 여러 언어가 섞인 녹음, `ko` 결과가 아쉬울 때 |
 
 **faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 한국어 녹음에 맞춘 모델을 사용할 수 있어요.
 
@@ -39,24 +38,23 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 
 | GPU | 방식 | 지원 엔진 | 설치 |
 |---|---|---|---|
-| Apple Silicon (M1 이상 Mac) | mlx-whisper (fp16, Metal), Qwen3-ASR은 mlx-audio (8bit) | `ko`, `whisper`, `qwen` | `install.py`(또는 `setup.sh`)가 자동으로 mlx-whisper·mlx-audio를 설치하고 한국어 모델을 MLX 형식으로 1회 변환. `whisper` 엔진은 [mlx-community](https://huggingface.co/mlx-community) 변환본을 받아 씀 |
-| NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16), `qwen`·`cohere`는 PyTorch | `ko`, `whisper`, `qwen`, `cohere` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
-| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
-| AMD Radeon 등 DX12 GPU (Windows) | ONNX Runtime + DirectML | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `install.py --amd-gpu` 또는 `setup.bat`(AMD 그래픽만 있을 때 자동). 모델을 ONNX로 1회 변환 |
+| Apple Silicon (M1 이상 Mac) | mlx-whisper (fp16, Metal), Qwen3-ASR은 mlx-audio (8bit) | `ko`, `qwen` | `install.py`(또는 `setup.sh`)가 자동으로 mlx-whisper·mlx-audio를 설치하고 한국어 모델을 MLX 형식으로 1회 변환. `qwen`은 [mlx-community](https://huggingface.co/mlx-community) 변환본을 받아 씀 |
+| NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16), `qwen`·`cohere`는 PyTorch | `ko`, `qwen`, `cohere` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
+| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 (변환기는 별도 가상환경 `.venv-export`에 설치) |
+| AMD Radeon 등 | 지원하지 않음 (CPU로 동작) | — | — |
 
-자동 순서는 Apple Silicon(MLX) → NVIDIA → 인텔 GPU → DirectML(AMD 등) → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. MLX·인텔 GPU·DirectML 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요. MLX 경로는 무음 구간을 건너뛰어 무음에서 헛말이 나오지 않게 해요.
+자동 순서는 Apple Silicon(MLX) → NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. MLX·인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요. MLX 경로는 무음 구간을 건너뛰어 무음에서 헛말이 나오지 않게 해요.
 
 어떤 경로가 실제로 쓰이는지는 `python transcribe.py --doctor`(Claude에서는 `check_setup` 도구)로 확인하세요. 장치 감지, 준비된 모델, 결과 저장 폴더를 보여 주고 10초 시험 음성을 그 경로로 실제 변환해 봐요.
 
-> DirectML 경로는 AMD 실기기에서 아직 측정하지 못했어요. 같은 코드를 CPU 실행 장치로 바꿔 ONNX 변환·타임스탬프 변환·이어하기·반복 복구까지 검증했어요. AMD에서 돌려 보면 `--doctor` 결과를 이슈로 남겨 주세요. 인텔용 `optimum-intel`과 AMD용 `optimum-onnx`는 서로 다른 버전을 요구해서 한 가상환경에 같이 설치할 수 없어요.
+> **인텔 GPU 변환 환경** · 실행에 쓰는 `openvino-genai`는 transformers가 필요 없지만, 모델을 OpenVINO 형식으로 바꾸는 `optimum-intel`은 transformers 5.6 미만을 요구해요. 그래서 최초 1회 변환은 설치 폴더의 별도 가상환경 `.venv-export`(transformers 5.5 등)에서 하고, 메인 가상환경은 최신 transformers를 그대로 써요. 이 변환기는 아직 Python 3.14를 지원하지 않아서 `.venv-export`는 **Python 3.10~3.13**으로 만들어요. 메인 가상환경이 3.14여도 PATH(Windows는 `py` 런처)에서 3.13 이하를 찾아 쓰고, 없으면 CPU로 진행하면서 설치 안내를 보여 줘요. `.venv-export`는 첫 변환 때 자동으로 만들어지고, 변환이 끝난 뒤에는 지워도 돼요(다시 변환할 때 새로 만듦).
 
-- Intel GPU에서 일반 Whisper 모델을 처음 사용하면 `large-v3`는 약 3.1GB, `large-v3-turbo`는 약 1.6GB의 가중치를 내려받아 OpenVINO로 변환합니다. 이후에는 저장된 모델을 재사용합니다.
 - 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
-- `ko`, `whisper`는 문장마다 타임스탬프가 붙어요. `cohere`·`qwen`은 모델이 타임스탬프를 주지 않아서 녹음을 조용한 틈에서 잘라(`cohere` 약 20초, `qwen` 약 30초) 조각마다 변환하고, 조각 시작 시각을 붙여요. 덕분에 이어하기와 반복 복구가 돼요. `qwen`은 말소리가 없는 조각을 건너뛰어요.
+- `ko`는 문장마다 타임스탬프가 붙어요. `cohere`·`qwen`은 모델이 타임스탬프를 주지 않아서 녹음을 조용한 틈에서 잘라(`cohere` 약 20초, `qwen` 약 30초) 조각마다 변환하고, 조각 시작 시각을 붙여요. 덕분에 이어하기와 반복 복구가 돼요. `qwen`은 말소리가 없는 조각을 건너뛰어요.
 - `qwen`은 Apple Silicon에서 mlx-community의 8bit 변환본(약 2.5GB), 그 밖에서는 공식 transformers 변환본 `Qwen/Qwen3-ASR-1.7B-hf`(약 4.1GB)를 처음 쓸 때 내려받아요. 7분짜리 한국어 합성 음성 기준으로 MLX는 약 19초, 같은 Mac의 CPU는 약 77초 걸렸어요(Apple M5 · 24GB, 모델 로드 포함).
-- `qwen`은 `transformers` 5.14 이상이 필요해요(기본 설치에 포함). `--intel-gpu`·`--amd-gpu` 설치는 OpenVINO·ONNX 변환기 때문에 transformers를 4.x로 내려서 `qwen`을 쓸 수 없어요.
+- `qwen`은 `transformers` 5.14 이상이 필요해요(기본 설치에 포함, `--intel-gpu` 설치에서도 그대로 유지돼요). 인텔 GPU에는 `qwen`용 OpenVINO 경로가 없어서 CPU로 돌아요.
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
-- 정확도 차이는 녹음 상태에 따라 달라요. 결과는 엔진·모델마다 따로 저장되니 같은 녹음을 여러 모델로 돌려 직접 비교해보세요: `녹음.ko.txt`, `녹음.whisper.txt`(large-v3-turbo), `녹음.whisper.large-v3.txt`, `녹음.whisper.small.txt` 등.
+- 정확도 차이는 녹음 상태에 따라 달라요. 결과는 엔진마다 따로 저장되니 같은 녹음을 여러 엔진으로 돌려 직접 비교해보세요: `녹음.ko.txt`, `녹음.qwen.txt`, `녹음.cohere.txt`.
 
 ### 노트북 실측
 
@@ -65,11 +63,8 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 | 모델 | 장치 | 3분 녹음 첫 실행 | 3분 녹음 모델 재사용 | 2시간 환산 |
 |---|---|---:|---:|---:|
 | BatiSay KO Turbo | Intel Arc · OpenVINO FP16 | 17.00초 | 5.87초 | 약 4분 |
-| Whisper `large-v3` | Intel Arc · OpenVINO FP16 | 57.56초 | 38.13초 | 약 25분 |
-| Whisper `large-v3-turbo` | Intel Arc · OpenVINO FP16 | 19.83초 | 9.94초 | 약 7분 |
-| Whisper `large-v3-turbo` | CPU · faster-whisper INT8 | 93.46초 | 105.46초 | 약 70분 |
 
-2시간 환산은 모델을 불러둔 상태의 3분 측정값을 40배 한 값입니다. 별도의 실제 강의에서 `large-v3`는 **61분 11초를 7분 8초**에 변환했습니다(모델 로딩 포함, 같은 속도라면 2시간 약 14분). 녹음의 발화 밀도, 잡음, 재시도에 따라 실제 속도가 달라집니다. Cohere 엔진은 별도 모델 접근과 의존성이 필요해 측정하지 않았습니다.
+2시간 환산은 모델을 불러둔 상태의 3분 측정값을 40배 한 값입니다. 녹음의 발화 밀도, 잡음, 재시도에 따라 실제 속도가 달라집니다. Cohere 엔진은 별도 모델 접근과 의존성이 필요해 측정하지 않았습니다.
 
 ## 설치와 실행
 
@@ -91,11 +86,11 @@ python3 install.py
 
 녹음 파일 경로를 붙여넣고 모델 번호를 선택합니다. 파일 경로를 인자로 직접 넘길 수도 있습니다. Windows에서 기존 `setup.bat`과 `transcribe_menu.bat`도 사용할 수 있습니다.
 
-- **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko`, `whisper large-v3`, `whisper large-v3-turbo`에서 사용합니다.
-- **AMD GPU** · Windows에서 설치 명령에 `--amd-gpu`를 추가합니다(DirectML, `--intel-gpu`와 함께 쓸 수 없음). DX12를 지원하는 최신 그래픽 드라이버가 필요해요.
+- **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko` 엔진에서 사용합니다. 변환기는 별도 가상환경 `.venv-export`에 설치돼요.
+- **AMD GPU** · 지원하지 않아요. AMD 그래픽만 있는 PC는 CPU로 동작해요.
 - **NVIDIA GPU** · x86-64 Windows/Linux에서 설치 명령에 `--nvidia-gpu`를 추가하면 CTranslate2용 cuBLAS·cuDNN을 pip로 설치합니다(CUDA Toolkit 불필요, 최신 드라이버 필요). Windows의 기존 `setup.bat`은 `nvidia-smi`가 있으면 자동으로 설치합니다.
 - **모델 미리 준비** · `install.py`는 한국어 모델을 설치 중에 미리 내려받아 변환합니다(`--intel-gpu`면 OpenVINO 형식까지). 첫 변환이 멈춘 것처럼 보이지 않게 하려는 것이고, 나중으로 미루려면 `--skip-models`를 붙이세요.
-- **macOS** · Apple Silicon(M1 이상)이면 `install.py`가 mlx-whisper를 자동으로 설치하고 한국어 모델을 MLX 형식으로 미리 변환해 GPU로 실행합니다. 인텔 Mac은 CPU 경로로 실행합니다. `./setup.sh`는 `install.py --register-claude`를 한 번에 실행하는 단축 스크립트예요.
+- **macOS** · Apple Silicon(M1 이상)이면 `install.py`가 mlx-whisper·mlx-audio를 자동으로 설치하고 한국어 모델을 MLX 형식으로 미리 변환해 GPU로 실행합니다. 인텔 Mac은 CPU 경로로 실행합니다. `./setup.sh`는 `install.py --register-claude`를 한 번에 실행하는 단축 스크립트예요.
 - **Claude Desktop** · Windows/macOS에서 설치 명령에 `--register-claude`를 추가한 뒤 앱을 완전히 종료하고 다시 실행합니다.
 - **Linux MCP 클라이언트** · stdio 서버로 등록합니다. 실행 명령에는 가상환경 Python의 절대 경로, 인자에는 `transcribe_mcp.py`의 절대 경로를 지정합니다.
 
@@ -108,7 +103,7 @@ output/
 ├─ 운영체제 3주차/              ← 녹음 하나
 │  ├─ source.txt               (원본 파일 경로)
 │  ├─ 운영체제 3주차.ko.txt
-│  └─ 운영체제 3주차.whisper.large-v3.txt
+│  └─ 운영체제 3주차.qwen.txt
 └─ Lecture12_…/                ← 삼성노트 하나
    ├─ 추출/                     (노트에서 꺼낸 녹음·PDF와 각 녹음의 변환 결과)
    └─ 정리본/                   (책 .html / .md)
@@ -141,7 +136,7 @@ Windows 예시입니다. macOS와 Linux에서는 Python 경로를 `.venv/bin/pyt
 
 ```
 .venv\Scripts\python transcribe.py 녹음.m4a
-.venv\Scripts\python transcribe.py lecture.mp4 --engine whisper --model large-v3 --lang ko --gpu
+.venv\Scripts\python transcribe.py lecture.mp4 --engine qwen --lang en
 ```
 
 ## 테스트
@@ -156,7 +151,7 @@ python -m pytest -q tests
 ## 구조
 
 ```
-Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) → 변환 엔진(MLX·CUDA·OpenVINO·DirectML·CPU) → output/<녹음>/녹음.ko.txt
+Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) → 변환 엔진(MLX·CUDA·OpenVINO·CPU) → output/<녹음>/녹음.ko.txt
 ```
 
 - `transcribe.py`: 변환 엔진 (CLI 겸용)
@@ -169,7 +164,7 @@ Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) 
 코드는 MIT지만, 내려받는 모델은 각자의 라이선스를 따라요.
 
 - `batiai/batisay-ko-turbo` (기본 한국어 엔진): BatiAI Community 라이선스. 개인·연구용은 무료, 일정 규모 이상 상업적 이용은 별도 계약 필요
-- Whisper (faster-whisper, mlx-whisper): MIT
+- faster-whisper, mlx-whisper (ko 엔진 실행기): MIT
 - `CohereLabs/cohere-transcribe-03-2026`: Apache 2.0, Hugging Face 약관 동의 필요(게이트 모델)
 - `Qwen/Qwen3-ASR-1.7B` (및 `-hf`·mlx-community 변환본): Apache 2.0
 

@@ -68,23 +68,21 @@ def test_output_dir_from_config_json(tmp_path, monkeypatch):
 
 
 # ---------- 결과 파일 이름 ----------
-@pytest.mark.parametrize("engine,model,name", [
-    ("ko", "large-v3-turbo", "강의.ko.txt"),
-    ("whisper", "large-v3-turbo", "강의.whisper.txt"),
-    ("whisper", "turbo", "강의.whisper.txt"),
-    ("whisper", "large-v3", "강의.whisper.large-v3.txt"),
-    ("whisper", "small", "강의.whisper.small.txt"),
+@pytest.mark.parametrize("engine,name", [
+    ("ko", "강의.ko.txt"),
+    ("qwen", "강의.qwen.txt"),
+    ("cohere", "강의.cohere.txt"),
 ])
-def test_output_path_is_unique_per_model(engine, model, name):
-    assert tr.output_path("강의.m4a", engine, model).name == name
+def test_output_path_is_unique_per_engine(engine, name):
+    assert tr.output_path("강의.m4a", engine).name == name
 
 
-def test_finished_outputs_lists_every_engine_and_model(tmp_path):
+def test_finished_outputs_lists_every_engine(tmp_path):
     audio = tmp_path / "강의.m4a"
-    for suffix in ("ko", "whisper", "whisper.large-v3"):
+    for suffix in ("ko", "qwen", "whisper"):   # whisper는 없어진 엔진이라 목록에서 빠짐
         (tmp_path / f"강의.{suffix}.txt").write_text("x", encoding="utf-8")
     (tmp_path / "강의.notes.txt").write_text("x", encoding="utf-8")  # 변환 결과가 아님
-    assert tr.finished_outputs(audio) == ["ko", "whisper", "whisper.large-v3"]
+    assert tr.finished_outputs(audio) == ["ko", "qwen"]
 
 
 # ---------- 반복 인식 감지·복구 ----------
@@ -134,7 +132,7 @@ def test_resume_from_interrupted_part(tmp_path, monkeypatch):
     audio.write_bytes(b"x")
     starts = []
 
-    def engine(audio, engine="ko", lang="ko", model="m", gpu=None, on_progress=None, start_at=0.0):
+    def engine(audio, engine="ko", lang="ko", gpu=None, on_progress=None, start_at=0.0):
         starts.append(start_at)
         for t in range(0, 600, 60):
             if t < start_at:
@@ -270,37 +268,27 @@ def test_cohere_loop_piece_is_split_and_retried(monkeypatch):
     assert list(tr.run_cohere("a.m4a")) == [(0.0, tr.LOOP_MARKER)]
 
 
-# ---------- GPU 선택·DirectML·자가 진단 ----------
-@pytest.mark.parametrize("mlx,cuda,intel,dml,gpu,expected", [
-    (True, False, False, False, None, "mlx"),
-    (False, True, True, True, None, "cuda"),
-    (False, False, True, True, None, "openvino"),
-    (False, False, False, True, None, "directml"),
-    (False, False, False, False, None, "cpu"),
-    (True, True, True, True, False, "cpu"),          # --cpu 강제
+# ---------- GPU 선택·자가 진단 ----------
+@pytest.mark.parametrize("mlx,cuda,intel,gpu,expected", [
+    (True, False, False, None, "mlx"),
+    (False, True, True, None, "cuda"),
+    (False, False, True, None, "openvino"),
+    (False, False, False, None, "cpu"),
+    (True, True, True, False, "cpu"),          # --cpu 강제
 ])
-def test_gpu_backend_order(monkeypatch, mlx, cuda, intel, dml, gpu, expected):
+def test_gpu_backend_order(monkeypatch, mlx, cuda, intel, gpu, expected):
     monkeypatch.setattr(tr, "mlx_available", lambda: mlx)
     monkeypatch.setattr(tr, "cuda_available", lambda: cuda)
     monkeypatch.setattr(tr, "intel_gpu_available", lambda: intel)
-    monkeypatch.setattr(tr, "directml_available", lambda: dml)
     assert tr.gpu_backend(gpu) == expected
 
 
 def test_gpu_start_failure_falls_back_to_cpu(monkeypatch):
-    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "directml")
-    monkeypatch.setattr(tr, "ensure_onnx_model", lambda *a: (_ for _ in ()).throw(tr._GPUStartError("no driver")))
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "openvino")
+    monkeypatch.setattr(tr, "ensure_ko_ov_model", lambda: (_ for _ in ()).throw(tr._OVStartError("no driver")))
     monkeypatch.setattr(tr, "ensure_ko_model", lambda: "ct2")
     monkeypatch.setattr(tr, "run_whisper", lambda *a, **k: iter([(0.0, "CPU로 변환")]))
     assert list(tr.run_ko("a.m4a")) == [(0.0, "CPU로 변환")]
-
-
-def test_onnx_rows_reads_pipeline_chunks():
-    pipe = lambda audio, **kw: {"text": "가 나", "chunks": [{"timestamp": (0.0, 2.0), "text": " 가"},
-                                                         {"timestamp": (None, None), "text": " 나 "},
-                                                         {"timestamp": (3.0, 4.0), "text": "  "}]}
-    assert tr._onnx_rows(pipe, np.zeros(10, np.float32), "ko") == [(0.0, "가"), (0.0, "나")]
-    assert tr._onnx_rows(lambda a, **k: {"text": " 전체 "}, None, "ko") == [(0.0, "전체")]
 
 
 def test_stale_export_folders_are_cleaned(tmp_path):
@@ -318,22 +306,75 @@ def test_stale_export_folders_are_cleaned(tmp_path):
 
 
 def test_doctor_reports_and_skips_test_without_models(monkeypatch, tmp_path):
-    for name in ("KO_DIR", "KO_MLX_DIR", "KO_OV_DIR", "KO_ONNX_DIR", "LARGE_V3_OV_DIR",
-                 "LARGE_V3_TURBO_OV_DIR"):
+    for name in ("KO_DIR", "KO_MLX_DIR", "KO_OV_DIR"):
         monkeypatch.setattr(tr, name, tmp_path / name)
-    monkeypatch.setattr(tr, "_WHISPER_ONNX_DIRS", {k: tmp_path / k for k in tr._WHISPER_ONNX_DIRS})
     monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "cpu")
     report = tr.doctor(run_test=True)
     assert "자동 선택: cpu" in report and "준비된 모델: 없음" in report and "건너뜀" in report
 
 
-def test_install_rejects_conflicting_gpu_options():
+def test_install_no_longer_offers_amd_gpu():
     import subprocess
     root = Path(__file__).resolve().parents[1]
-    r = subprocess.run([sys.executable, str(root / "install.py"), "--amd-gpu", "--intel-gpu"],
-                       capture_output=True, text=True)
-    # 운영체제에 따라 먼저 걸리는 검사가 다름 (macOS에서는 --intel-gpu 자체가 거부됨)
-    assert r.returncode == 2 and any(m in r.stderr for m in ("Windows only", "Choose one", "requires x86-64"))
+    r = subprocess.run([sys.executable, str(root / "install.py"), "--amd-gpu"], capture_output=True, text=True)
+    assert r.returncode == 2 and "unrecognized arguments: --amd-gpu" in r.stderr
+
+
+def test_openvino_export_runs_in_separate_env(monkeypatch, tmp_path):
+    """변환은 .venv-export의 python으로, 결과는 임시 폴더에서 다 만든 뒤에만 옮김."""
+    import subprocess
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        out = Path(cmd[-1])
+        out.mkdir(parents=True)
+        (out / "openvino_encoder_model.xml").write_text("x")
+        return subprocess.CompletedProcess(cmd, 0)
+    monkeypatch.setattr(tr, "ensure_export_env", lambda: "/export/python")
+    monkeypatch.setattr(tr, "_ensure_ov_tokenizers", lambda d: None)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    target = tmp_path / "models" / "ko-ov"
+    assert tr._ensure_ov_model("repo/x", target) == str(target)
+    assert calls[0][0] == "/export/python" and "openvino" in calls[0]
+    assert (target / "openvino_encoder_model.xml").is_file()
+
+
+def test_export_env_installs_old_transformers_once(monkeypatch, tmp_path):
+    import subprocess
+    env = tmp_path / ".venv-export"
+    monkeypatch.setattr(tr, "EXPORT_ENV", env)
+    monkeypatch.setattr(tr, "_export_base_python", lambda: ["/py313"])
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if cmd[1:3] == ["-m", "venv"]:
+            py = tr.export_python()
+            py.parent.mkdir(parents=True)
+            py.write_text("")
+        return subprocess.CompletedProcess(cmd, 0)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    py = tr.ensure_export_env()
+    assert py == str(tr.export_python())
+    assert calls[0] == ["/py313", "-m", "venv", str(env)]             # 3.10~3.13 Python으로 만듦
+    assert any("transformers>=4.51,<5.6" in c for c in calls)
+    calls.clear()
+    tr.ensure_export_env()          # 두 번째부터는 아무것도 설치하지 않음
+    assert calls == []
+
+
+def test_export_base_python_needs_310_to_313(monkeypatch):
+    import shutil
+    monkeypatch.setattr(tr.sys, "version_info", (3, 14, 0))
+    monkeypatch.setattr(tr.os, "name", "posix")
+    found = {"python3.12": "/usr/bin/python3.12"}
+    monkeypatch.setattr(shutil, "which", lambda name: found.get(name))
+    monkeypatch.setattr(tr, "_python_version", lambda exe: (3, 12))
+    assert tr._export_base_python() == ["/usr/bin/python3.12"]
+    found.clear()
+    with pytest.raises(tr._OVStartError, match="Python 3.10~3.13"):
+        tr._export_base_python()
 
 
 # ---------- Apple Silicon (MLX) ----------
@@ -391,16 +432,6 @@ def test_mlx_start_failure_falls_back_to_cpu(monkeypatch):
     monkeypatch.setattr(tr, "ensure_ko_model", lambda: "ct2")
     monkeypatch.setattr(tr, "run_whisper", lambda *a, **k: iter([(0.0, "CPU로 변환")]))
     assert list(tr.run_ko("a.m4a")) == [(0.0, "CPU로 변환")]
-
-
-def test_whisper_engine_uses_mlx_repo_on_apple_silicon(monkeypatch):
-    seen = []
-    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "mlx")
-    monkeypatch.setattr(tr, "run_mlx", lambda audio, model, lang, **k: seen.append(model) or iter([(0.0, "ok")]))
-    monkeypatch.setattr(tr, "run_whisper", lambda *a, **k: seen.append("cpu") or iter([(0.0, "cpu")]))
-    list(tr.transcribe("a.m4a", "whisper", "en", "small"))
-    list(tr.transcribe("a.m4a", "whisper", "en", "/local/ct2-model"))   # MLX 변환본이 없는 로컬 모델은 CPU
-    assert seen == ["mlx-community/whisper-small-mlx", "cpu"]
 
 
 # ---------- Qwen3-ASR ----------

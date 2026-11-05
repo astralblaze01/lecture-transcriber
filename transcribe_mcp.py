@@ -43,7 +43,7 @@ mcp = FastMCP(
         "[녹음 변환] 경로를 모르면 find_recordings로 찾고, 애매하면 사용자에게 확인하세요. "
         "start_transcription 후 get_transcription을 status가 done이 될 때까지 반복 호출하세요. "
         "CPU로 돌면 1시간 녹음에 수십 분 걸릴 수 있으니(GPU·Apple Silicon은 훨씬 빠름) 진행률을 짧게 알려주세요. "
-        "한국어는 engine='ko'(기본), 다른 언어는 engine='whisper'와 language 코드를 쓰세요.\n"
+        "한국어는 engine='ko'(기본), 다른 언어는 engine='qwen'과 language 코드를 쓰세요.\n"
         "[강의를 책으로] 사용자가 노트/PDF와 녹음을 바탕으로 정리·책·요약을 원하면: "
         "1) prepare_lecture_note로 노트를 풀고 녹음 변환을 시작, "
         "2) 기다리는 동안 read_pdf_text로 슬라이드 내용 파악, "
@@ -76,7 +76,7 @@ def _worker():
 
             # 중간에 끊긴 .part가 있으면 그 지점부터 이어서 함. 실패해도 .part는 남겨 다음에 이어감.
             out = tr.transcribe_to_file(job["file"], job["engine"], job["language"],
-                                        job["model"], job["gpu"], on_progress, force=job["force"])
+                                        job["gpu"], on_progress, force=job["force"])
             job.update(status="done", progress=1.0, output=str(out), finished=time.time())
         except Exception as e:  # noqa: BLE001
             job.update(status="error", error=f"{type(e).__name__}: {e} (다시 시작하면 끊긴 지점부터 이어서 해요)",
@@ -204,12 +204,11 @@ def find_recordings(folder: str = "", limit: int = 15) -> str:
 
 @mcp.tool()
 def start_transcription(file_path: str, engine: str = "ko", language: str = "ko",
-                        model: str = "large-v3-turbo", gpu: bool | None = None,
-                        force: bool = False) -> str:
+                        gpu: bool | None = None, force: bool = False) -> str:
     """녹음 파일을 텍스트로 변환하는 작업을 시작하고 job_id를 돌려줍니다.
-    engine: 'ko'(한국어 특화, 기본) | 'whisper'(다국어, model로 크기 선택) | 'cohere'(GPU 권장)
-            | 'qwen'(Qwen3-ASR 1.7B, 다국어·방언, 약 30초 단위 타임스탬프, Apple Silicon은 MLX)
-    gpu: 비우면 지원 GPU 자동 사용, false면 CPU 강제. Intel GPU는 ko와 whisper large-v3/large-v3-turbo 지원.
+    engine: 'ko'(한국어 특화, 기본) | 'qwen'(Qwen3-ASR 1.7B, 다국어·방언, 약 30초 단위 타임스탬프,
+            Apple Silicon은 MLX) | 'cohere'(GPU 권장)
+    gpu: 비우면 지원 GPU 자동 사용, false면 CPU 강제. Intel GPU(OpenVINO)는 ko 엔진만 지원.
     language: 'ko', 'en' 등. 이미 변환한 파일은 force=false면 저장된 결과를 바로 씁니다."""
     path = _clean_path(file_path)
     if not path.is_file():
@@ -219,10 +218,10 @@ def start_transcription(file_path: str, engine: str = "ko", language: str = "ko"
 
     jid = uuid.uuid4().hex[:8]
     job = dict(id=jid, file=str(path), engine=engine, language=language,
-               model=model, gpu=gpu, force=force, status="queued", progress=0.0)
+               gpu=gpu, force=force, status="queued", progress=0.0)
     jobs[jid] = job
 
-    out = tr.output_path(path, engine, model)
+    out = tr.output_path(path, engine)
     if out.exists() and not force:
         job.update(status="done", progress=1.0, output=str(out), cached=True,
                    started=time.time(), finished=time.time())
@@ -231,7 +230,6 @@ def start_transcription(file_path: str, engine: str = "ko", language: str = "ko"
     # 같은 파일·엔진이 이미 돌고 있으면 그 작업을 알려줌
     for other in jobs.values():
         if (other is not job and other["file"] == job["file"] and other["engine"] == engine
-                and tr.output_path(path, engine, other["model"]) == out
                 and other["status"] in ("queued", "running")):
             del jobs[jid]
             return f"이미 진행 중인 작업이 있어요. job_id: {other['id']}"
@@ -274,8 +272,7 @@ def _remember_dir(d: Path):
 
 @mcp.tool()
 def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko",
-                         model: str = "large-v3-turbo", gpu: bool | None = None,
-                         force: bool = False) -> str:
+                         gpu: bool | None = None, force: bool = False) -> str:
     """강의 노트를 책으로 만들기 위한 준비를 한 번에 합니다.
     .sdocx(삼성노트)면 압축을 풀어 녹음과 PDF를 꺼내고, 녹음 변환 작업을 바로 시작합니다.
     .pdf면 같은 폴더에서 이름이 비슷한 녹음을 찾아 변환을 시작합니다.
@@ -315,7 +312,7 @@ def prepare_lecture_note(note_path: str, engine: str = "ko", language: str = "ko
     if not audios:
         lines.append("녹음: 없음 — 노트에 녹음이 안 들어있어요. 사용자에게 녹음 파일 위치를 물어보세요.")
     for a in audios:
-        res = start_transcription(str(a), engine=engine, language=language, model=model, gpu=gpu, force=force)
+        res = start_transcription(str(a), engine=engine, language=language, gpu=gpu, force=force)
         jid = re.search(r"job_id: (\w+)", res)
         dur = _duration(a)
         lines.append(f"녹음: {a}  (길이 {tr.fmt(dur) if dur else '?'})  → "
@@ -368,7 +365,7 @@ def save_book(folder: str, title: str, markdown: str) -> str:
 
 @mcp.tool()
 def check_setup(run_test: bool = True) -> str:
-    """설치·GPU 상태를 점검합니다. 어떤 가속(NVIDIA CUDA / 인텔 OpenVINO / DirectML / CPU)이 선택되는지,
+    """설치·GPU 상태를 점검합니다. 어떤 가속(Apple Silicon MLX / NVIDIA CUDA / 인텔 OpenVINO / CPU)이 선택되는지,
     모델이 준비됐는지 보여 주고, run_test=true면 10초 시험 음성으로 그 경로가 실제로 도는지 확인합니다.
     변환이 느리거나 GPU를 안 쓰는 것 같을 때 먼저 호출하세요."""
     return tr.doctor(run_test=run_test)
