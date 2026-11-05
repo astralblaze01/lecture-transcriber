@@ -40,7 +40,7 @@ Claude에서는 “Qwen으로 변환해줘”처럼 모델 이름을 지정하�
 |---|---|---|---|
 | Apple Silicon (M1 이상 Mac) | mlx-whisper (fp16, Metal), Qwen3-ASR은 mlx-audio (8bit) | `ko`, `qwen` | `install.py`(또는 `setup.sh`)가 자동으로 mlx-whisper·mlx-audio를 설치하고 한국어 모델을 MLX 형식으로 1회 변환. `qwen`은 [mlx-community](https://huggingface.co/mlx-community) 변환본을 받아 씀 |
 | NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16), `qwen`·`cohere`는 PyTorch | `ko`, `qwen`, `cohere` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
-| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 (변환기는 별도 가상환경 `.venv-export`에 설치) |
+| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI | `ko` FP16, `qwen` INT8 | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 (변환기는 별도 가상환경 `.venv-export`에 설치) |
 | AMD Radeon 등 | 지원하지 않음 (CPU로 동작) | — | — |
 
 자동 순서는 Apple Silicon(MLX) → NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. MLX·인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요. MLX 경로는 무음 구간을 건너뛰어 무음에서 헛말이 나오지 않게 해요.
@@ -51,10 +51,53 @@ Claude에서는 “Qwen으로 변환해줘”처럼 모델 이름을 지정하�
 
 - 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
 - `ko`는 문장마다 타임스탬프가 붙어요. `cohere`·`qwen`은 모델이 타임스탬프를 주지 않아서 녹음을 조용한 틈에서 잘라(`cohere` 약 20초, `qwen` 약 30초) 조각마다 변환하고, 조각 시작 시각을 붙여요. 덕분에 이어하기와 반복 복구가 돼요. `qwen`은 말소리가 없는 조각을 건너뛰어요.
-- `qwen`은 Apple Silicon에서 mlx-community의 8bit 변환본(약 2.5GB), 그 밖에서는 공식 transformers 변환본 `Qwen/Qwen3-ASR-1.7B-hf`(약 4.1GB)를 처음 쓸 때 내려받아요. 7분짜리 한국어 합성 음성 기준으로 MLX는 약 19초, 같은 Mac의 CPU는 약 77초 걸렸어요(Apple M5 · 24GB, 모델 로드 포함).
-- `qwen`은 `transformers` 5.14 이상이 필요해요(기본 설치에 포함, `--intel-gpu` 설치에서도 그대로 유지돼요). 인텔 GPU에는 `qwen`용 OpenVINO 경로가 없어서 CPU로 돌아요.
+- `qwen`은 Apple Silicon에서 mlx-community의 8bit 변환본(약 2.5GB), CPU/CUDA에서는 공식 transformers 변환본 `Qwen/Qwen3-ASR-1.7B-hf`(약 4.1GB)를 처음 쓸 때 내려받아요. 7분짜리 한국어 합성 음성 기준으로 MLX는 약 19초, 같은 Mac의 CPU는 약 77초 걸렸어요(Apple M5 · 24GB, 모델 로드 포함).
+- `qwen`의 CPU/CUDA 경로는 기본 설치의 transformers 5.14 이상을 사용해요. Intel GPU에서는 아래의 모델 준비를 마친 뒤 OpenVINO GenAI로 실행해요.
+
+### Qwen3-ASR 1.7B를 Intel GPU로 실행
+
+Windows PowerShell에서 프로젝트 폴더를 열고 실행하세요.
+
+```powershell
+.\.venv\Scripts\python.exe install.py --intel-gpu --export-qwen --skip-models
+.\.venv\Scripts\python.exe transcribe.py --doctor
+.\.venv\Scripts\python.exe transcribe.py ".\sample.wav" --engine qwen --lang ko --gpu
+```
+
+최초 준비 시 공식 Qwen 체크포인트를 다운로드해 INT8로 변환해요. 변환용 `qwen-asr`와 Optimum Intel은 `.venv-export-qwen`에 설치하고, 결과는 `models/qwen3-asr-1.7b-ov-int8`에 저장해요. 메인 환경에 예전 설치의 `optimum-intel`이 남아 의존성 충돌이 발생하면 `.\.venv\Scripts\python.exe -m pip uninstall optimum-intel`로 해당 패키지를 제거한 뒤 `pip check`를 실행하세요.
+
+`--doctor`는 장치와 모델 폴더를 확인해요. 실제 전사는 짧은 음성 파일로 확인하세요. GPU 초기화나 추론이 실패하면 이유를 표시하고 해당 조각부터 CPU로 이어갑니다. `--cpu`를 사용하면 처음부터 CPU로 실행해요.
+
+[OpenVINO GenAI ASR 문서](https://openvinotoolkit.github.io/openvino.genai/docs/use-cases/speech-recognition/)
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
 - 정확도 차이는 녹음 상태에 따라 달라요. 결과는 엔진마다 따로 저장되니 같은 녹음을 여러 엔진으로 돌려 직접 비교해보세요: `녹음.ko.txt`, `녹음.qwen.txt`, `녹음.cohere.txt`.
+
+### Qwen Intel GPU 구현 및 검증
+
+- `qwen`은 Intel GPU가 선택되면 OpenVINO GenAI의 `ASRPipeline`을 사용해요. 기존 PyTorch 경로는 CUDA와 CPU를, MLX 경로는 Apple Silicon을 지원해요.
+- 공식 `Qwen/Qwen3-ASR-1.7B`를 INT8 OpenVINO 형식으로 내보내 GPU에서 실행해요. Qwen 변환기는 Transformers 4.57.6을 요구하고 기존 Qwen CPU/CUDA 경로는 5.14 이상을 사용하므로, 변환 환경 `.venv-export-qwen`을 메인 환경과 BatiSay 변환 환경 `.venv-export`에서 분리했어요.
+- 전사 엔진만 교체하고 기존 오디오 조각 처리와 타임스탬프, 진행률, 중단 이어하기를 공유해요. GPU가 실패하면 해당 조각부터 CPU로 이어가요. CLI와 MCP 모두 같은 엔진 선택을 사용해요.
+
+Windows 11, Python 3.12.10, Intel Arc 140V, OpenVINO 2026.4.1 및 GenAI 2026.4.1.0에서 확인했어요. 아래 원본 노트의 녹음 두 개(총 61분 11초)를 한국어 설정으로 전사하는 데 약 **5분 14초** 걸렸어요. 작업 파일 시각으로 계산했으며 모델을 불러오는 시간은 포함하고, 모델의 최초 다운로드와 변환은 제외했어요. 두 녹음 모두 CPU 전환 없이 완료됐어요. 첫 번째 녹음 12분 55초에는 반복 인식으로 복구하지 못한 구간이 있어요. GPU 실패 전환과 이어하기를 포함해 테스트 46개가 통과했어요.
+
+- [원본 삼성 노트](examples/data-link-control-protocols/lecture.sdocx)
+- [녹음 1 전사본](examples/data-link-control-protocols/recording-1.qwen.txt)
+- [녹음 2 전사본](examples/data-link-control-protocols/recording-2.qwen.txt)
+
+이 예제를 직접 실행하려면 위의 모델 준비를 한 번 마치고, 프로젝트 폴더에서 PowerShell로 실행하세요.
+
+```powershell
+$python = '.\.venv\Scripts\python.exe'
+$note = (Resolve-Path '.\examples\data-link-control-protocols\lecture.sdocx').Path
+$recordings = & $python -c 'import sys; from pathlib import Path; from lecture_tools import extract_note; print(*extract_note(Path(sys.argv[1]))["audio"], sep=chr(10))' $note
+if ($LASTEXITCODE -ne 0) { throw '녹음 추출에 실패했습니다.' }
+foreach ($recording in $recordings) {
+    & $python .\transcribe.py $recording --engine qwen --lang ko --gpu
+    if ($LASTEXITCODE -ne 0) { throw "전사 실패: $recording" }
+}
+```
+
+로그의 `(Intel OpenVINO GPU)`와 `저장 완료` 경로를 확인하세요. 일반 녹음 파일은 추출 없이 `transcribe.py`에 바로 전달할 수 있어요.
 
 ### 노트북 실측
 

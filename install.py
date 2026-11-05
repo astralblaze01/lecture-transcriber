@@ -13,11 +13,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--intel-gpu", action="store_true",
                         help="Install Intel OpenVINO (the model converter goes in a separate .venv-export)")
+    parser.add_argument("--export-qwen", action="store_true",
+                        help="Export the Qwen3-ASR 1.7B INT8 model for OpenVINO")
     parser.add_argument("--nvidia-gpu", action="store_true", help="Install CUDA libraries for NVIDIA GPUs")
     parser.add_argument("--skip-models", action="store_true",
                         help="Do not download/convert the Korean model now (it is prepared on first use)")
     parser.add_argument("--register-claude", action="store_true", help="Register Claude Desktop on Windows or macOS")
     args = parser.parse_args()
+    if args.export_qwen and not args.intel_gpu:
+        parser.error("--export-qwen requires --intel-gpu.")
     if sys.version_info < (3, 10):
         parser.error("Python 3.10 or newer is required.")
     system = platform.system()
@@ -46,7 +50,7 @@ def main():
     if args.intel_gpu:
         # 실행용 OpenVINO만 메인 가상환경에. 변환기(optimum-intel)는 오래된 transformers를 요구해서
         # 최초 변환 때 transcribe.ensure_export_env()가 .venv-export에 따로 설치함
-        run("-m", "pip", "install", "openvino-genai")
+        run("-m", "pip", "install", "openvino-genai>=2026.4.1.0,<2027")
     if args.nvidia_gpu:
         # CTranslate2(faster-whisper)용 cuBLAS·cuDNN. CUDA Toolkit을 따로 설치하지 않아도 됨
         run("-m", "pip", "install", "nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10")
@@ -65,6 +69,8 @@ def main():
                       "d and t.ensure_ko_ov_model()")
         if args.nvidia_gpu:
             run("-c", "import transcribe as t; print('CUDA GPU:', t.cuda_available())")
+    if args.export_qwen:
+        run("-c", "import transcribe as t; print(t.ensure_qwen_ov_model())")
     if args.register_claude:
         run(str(ROOT / "register_claude.py"))
 

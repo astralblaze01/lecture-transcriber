@@ -263,8 +263,8 @@ def ensure_ko_ov_model():
     return _ensure_ov_model(KO_REPO, KO_OV_DIR)
 
 
-def export_python() -> Path:
-    return EXPORT_ENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+def export_python(env=None) -> Path:
+    return (env or EXPORT_ENV) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 EXPORT_PYTHONS = ("3.13", "3.12", "3.11", "3.10")   # optimum이 아직 Python 3.14를 지원하지 않음
@@ -306,24 +306,25 @@ def _python_version_via_launcher(v) -> bool:
         return False
 
 
-def ensure_export_env() -> str:
+def ensure_export_env(env=None, packages=EXPORT_PACKAGES) -> str:
     """OpenVINO 변환 전용 가상환경(Python 3.10~3.13)을 만들고 변환기를 설치(최초 1회).
     그 가상환경의 python 경로를 돌려줌."""
     import platform
     import shutil
     import subprocess
 
-    python, ready = export_python(), EXPORT_ENV / ".ready"
+    env = env or EXPORT_ENV
+    python, ready = export_python(env), env / ".ready"
     if python.is_file() and ready.is_file():
         return str(python)
     if python.is_file() and not (3, 10) <= _python_version(python) <= (3, 13):
-        log(f"변환 환경의 Python 버전이 맞지 않아 다시 만듭니다: {EXPORT_ENV}")
-        shutil.rmtree(EXPORT_ENV, ignore_errors=True)
-    log(f"[최초 1회] OpenVINO 변환 전용 가상환경을 만듭니다: {EXPORT_ENV} (몇 분 걸림)")
+        log(f"변환 환경의 Python 버전이 맞지 않아 다시 만듭니다: {env}")
+        shutil.rmtree(env, ignore_errors=True)
+    log(f"[최초 1회] OpenVINO 변환 전용 가상환경을 만듭니다: {env} (몇 분 걸림)")
     try:
         if not python.is_file():
             base = _export_base_python()
-            if subprocess.run([*base, "-m", "venv", str(EXPORT_ENV)],
+            if subprocess.run([*base, "-m", "venv", str(env)],
                               stdout=sys.stderr, stderr=sys.stderr).returncode != 0:
                 raise _OVStartError(f"변환 환경을 만들지 못했어요: {' '.join(base)} -m venv")
 
@@ -335,8 +336,8 @@ def ensure_export_env() -> str:
         if sys.platform != "darwin" and platform.machine().lower() in ("amd64", "x86_64"):
             # 변환에만 쓰므로 CUDA 없는 작은 CPU판 PyTorch로 충분
             pip("torch", "torchvision", "--index-url", "https://download.pytorch.org/whl/cpu")
-        pip(*EXPORT_PACKAGES)
-        ready.write_text(" ".join(EXPORT_PACKAGES), encoding="utf-8")
+        pip(*packages)
+        ready.write_text(" ".join(packages), encoding="utf-8")
     except OSError as exc:
         raise _OVStartError(f"변환 환경을 만들지 못했어요: {exc}") from exc
     return str(python)
@@ -751,6 +752,64 @@ QWEN_PIECE_S = 30
 QWEN_MAX_TOKENS = 512
 
 
+QWEN_OV_DIR = HERE / "models" / "qwen3-asr-1.7b-ov-int8"
+QWEN_EXPORT_ENV = HERE / ".venv-export-qwen"
+QWEN_EXPORT_PACKAGES = ("optimum-intel[openvino]==2.2.0", "qwen-asr==0.0.6",
+                        "openvino==2026.4.1", "openvino-tokenizers==2026.4.1.0")
+
+
+def ensure_qwen_ov_model():
+    """Export the original Qwen checkpoint in an isolated environment."""
+    import subprocess
+    import tempfile
+
+    with _models_lock:
+        if QWEN_OV_DIR.is_dir():
+            return str(QWEN_OV_DIR)
+        python = ensure_export_env(QWEN_EXPORT_ENV, QWEN_EXPORT_PACKAGES)
+        QWEN_OV_DIR.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="qwen-export-", dir=QWEN_OV_DIR.parent) as temp:
+            staging = Path(temp) / "model"
+            subprocess.run(
+                [python, "-m", "optimum.commands.optimum_cli", "export", "openvino",
+                 "--model", "Qwen/Qwen3-ASR-1.7B", "--task", "automatic-speech-recognition-with-past",
+                 "--trust-remote-code", "--weight-format", "int8", str(staging)],
+                stdout=sys.stderr, stderr=sys.stderr, check=True,
+            )
+            try:
+                staging.rename(QWEN_OV_DIR)
+            except FileExistsError:
+                if not QWEN_OV_DIR.is_dir():
+                    raise
+    return str(QWEN_OV_DIR)
+
+
+def _qwen_openvino(device):
+    from openvino_genai import ASRPipeline
+
+    if not QWEN_OV_DIR.is_dir():
+        raise _OVStartError("Qwen OpenVINO 모델이 필요해요: install.py --intel-gpu --export-qwen --skip-models")
+    key = ("qwen-openvino", str(QWEN_OV_DIR), device)
+    with _models_lock:
+        if key not in _models:
+            log(f"모델 로드 중: {QWEN_OV_DIR.name} (Intel OpenVINO {device})")
+            _models[key] = ASRPipeline(str(QWEN_OV_DIR), device)
+        model = _models[key]
+
+    def run(piece, language):
+        with _models_lock:
+            try:
+                result = model.generate(piece.tolist(), language=language,
+                                        max_new_tokens=QWEN_MAX_TOKENS)
+            except RuntimeError:
+                if _models.get(key) is model:
+                    del _models[key]
+                raise
+        return result.texts[0].strip() if result.texts else ""
+
+    return run
+
+
 def _qwen_language(lang):
     """언어 코드('ko')나 이름('Korean')을 Qwen3-ASR이 쓰는 이름으로."""
     try:
@@ -813,13 +872,33 @@ def _qwen_torch(gpu=None):
 def run_qwen(audio, lang="ko", gpu=None, on_progress=None, start_at=0.0, **_):
     language = _qwen_language(lang)
     run = None
-    if gpu_backend(gpu) == "mlx":
+    backend = gpu_backend(gpu)
+    if backend == "mlx":
         try:
             run = _qwen_mlx()
         except Exception as exc:  # noqa: BLE001  (설치·내려받기 문제면 CPU로)
             log(f"Qwen3-ASR을 Apple GPU(MLX)로 시작하지 못해 CPU로 바꿔요: {type(exc).__name__}: {exc}")
+    if backend == "openvino":
+        try:
+            run = _qwen_openvino(ov_device())
+        except Exception as exc:  # noqa: BLE001 (import, model or device initialization)
+            log(f"Qwen3-ASR Intel GPU 시작 실패, CPU로 전환: {exc}")
+            gpu = False
+            backend = "cpu"
     if run is None:
         run = _qwen_torch(gpu)
+
+    def transcribe_piece(piece):
+        nonlocal run, backend
+        try:
+            return run(piece, language)
+        except RuntimeError as exc:
+            if backend != "openvino":
+                raise
+            log(f"Qwen3-ASR Intel GPU 추론 실패, 현재 조각부터 CPU로 전환: {exc}")
+            backend = "cpu"
+        run = _qwen_torch(False)
+        return run(piece, language)
 
     wav, total = _decode_from(audio, start_at)
     spans = _speech_spans(wav, SR)
@@ -829,11 +908,11 @@ def run_qwen(audio, lang="ko", gpu=None, on_progress=None, start_at=0.0, **_):
         if clips:
             s, e = clips[0][0], clips[-1][1]
             piece = wav[int((a + s) * SR):int((a + e) * SR)]
-            text = run(piece, language)
+            text = transcribe_piece(piece)
             if _has_transcription_loop(text):
                 # 반복 인식이 나면 조각을 반으로 나눠 다시 시도
                 halves = [h for h in _split_in_half(piece) if len(h)]
-                retry = " ".join(run(h, language) for h in halves).strip()
+                retry = " ".join(transcribe_piece(h) for h in halves).strip()
                 text = retry if retry and not _has_transcription_loop(retry) else LOOP_MARKER
             if text:
                 yield start_at + a + s, text
@@ -993,8 +1072,17 @@ def qwen_status() -> str:
         _qwen_language("ko")
     except RuntimeError:
         return "사용 불가 — transformers 5.14 이상 필요"
-    if gpu_backend(None) == "mlx" and _version("mlx-audio"):
+    backend = gpu_backend(None)
+    if backend == "mlx" and _version("mlx-audio"):
         return "Apple GPU(MLX, mlx-audio)"
+    if backend == "openvino":
+        try:
+            from openvino_genai import ASRPipeline  # noqa: F401
+        except (ImportError, OSError):
+            return "CPU — OpenVINO GenAI ASRPipeline 필요"
+        if QWEN_OV_DIR.is_dir():
+            return f"Intel OpenVINO {ov_device()} — 모델 준비됨 (실제 추론은 qwen으로 확인)"
+        return "CPU — Intel GPU 감지, install.py --intel-gpu --export-qwen --skip-models 필요"
     return "transformers (CUDA 또는 CPU)"
 
 

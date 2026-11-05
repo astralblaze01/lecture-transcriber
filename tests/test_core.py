@@ -488,3 +488,53 @@ def test_run_qwen_recovers_loops_by_splitting(monkeypatch):
 def test_qwen_results_are_saved_separately(tmp_path, monkeypatch):
     monkeypatch.setenv("TRANSCRIBE_OUTPUT_DIR", str(tmp_path / "out"))
     assert tr.output_path(tmp_path / "강의.m4a", "qwen").name == "강의.qwen.txt"
+
+
+@pytest.mark.parametrize("fail_at", [None, "load", "second"])
+def test_qwen_openvino_resume_and_fallback(monkeypatch, fail_at):
+    calls = []
+    progress = []
+    wav = np.zeros(2 * tr.SR, dtype=np.float32)
+
+    def decode(audio, start_at):
+        assert start_at == 3.0
+        return wav, 5.0
+
+    def openvino(device):
+        assert device == "GPU"
+        if fail_at == "load":
+            raise RuntimeError("GPU unavailable")
+
+        def generate(piece, language):
+            calls.append("GPU")
+            assert language == "Korean"
+            if fail_at == "second" and len(calls) == 2:
+                raise RuntimeError("GPU out of memory")
+            return "GPU text"
+        return generate
+
+    def torch(gpu):
+        assert gpu is False
+
+        def generate(piece, language):
+            calls.append("CPU")
+            return "CPU text"
+        return generate
+
+    monkeypatch.setattr(tr, "_qwen_language", lambda lang: "Korean")
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu: "openvino")
+    monkeypatch.setattr(tr, "ov_device", lambda: "GPU")
+    monkeypatch.setattr(tr, "_qwen_openvino", openvino)
+    monkeypatch.setattr(tr, "_qwen_torch", torch)
+    monkeypatch.setattr(tr, "_decode_from", decode)
+    monkeypatch.setattr(tr, "_speech_spans", lambda *args: None)
+    monkeypatch.setattr(tr, "_cut_points", lambda *args, **kwargs: [0.0, 1.0, 2.0])
+    rows = list(tr.run_qwen("sample.wav", start_at=3.0, on_progress=progress.append))
+    assert [ts for ts, _ in rows] == [3.0, 4.0]
+    assert progress == [0.8, 1.0]
+    assert calls == {None: ["GPU", "GPU"], "load": ["CPU", "CPU"],
+                     "second": ["GPU", "GPU", "CPU"]}[fail_at]
+    assert [text for _, text in rows] == {
+        None: ["GPU text", "GPU text"], "load": ["CPU text", "CPU text"],
+        "second": ["GPU text", "CPU text"],
+    }[fail_at]
