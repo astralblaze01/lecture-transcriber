@@ -20,6 +20,7 @@ cohere 엔진은 추가 설치가 필요해요:
   + https://huggingface.co/CohereLabs/cohere-transcribe-03-2026 에서 약관 동의 후 `hf auth login`
 """
 import argparse
+import glob
 import os
 import re
 import sys
@@ -157,15 +158,33 @@ def _decode_from(audio, start_at):
 
 def run_whisper(audio, lang="ko", model="large-v3-turbo", gpu=None, on_progress=None, start_at=0.0):
     m = _whisper_model(model, gpu)
-    total = None
-    if start_at:
-        audio, total = _decode_from(audio, start_at)
-    segments, info = m.transcribe(audio, language=lang, vad_filter=True)
-    total = total or info.duration or 0
+    # 반복 구간을 다시 변환하려면 원본 파형이 필요해서 한 번만 디코딩해 둠
+    # (faster-whisper도 내부에서 어차피 전체를 디코딩하므로 메모리 사용은 같음)
+    wav, total = _decode_from(audio, start_at)
+    segments, _ = m.transcribe(wav, language=lang, vad_filter=True)
     for seg in segments:
         if on_progress and total:
             on_progress(min((start_at + seg.end) / total, 1.0))
-        yield start_at + seg.start, seg.text.strip()
+        text = seg.text.strip()
+        if _has_transcription_loop(text):
+            text = _retry_whisper_loop(m, wav, seg.start, seg.end, lang)
+        yield start_at + seg.start, text
+
+
+def _retry_whisper_loop(model, wav, start, end, lang):
+    """faster-whisper가 같은 구절을 반복 출력한 구간만, 앞 문맥 없이 다시 변환."""
+    clip = wav[int(start * SR):int(min(end, start + 25.0) * SR)]
+    if len(clip):
+        try:
+            segs, _ = model.transcribe(clip, language=lang, vad_filter=False,
+                                       condition_on_previous_text=False,
+                                       temperature=(0.2, 0.4, 0.6))
+            text = " ".join(s.text.strip() for s in segs).strip()
+            if text and not _has_transcription_loop(text):
+                return text
+        except RuntimeError as exc:
+            log(f"반복 인식 구간 재시도 실패: {exc}")
+    return LOOP_MARKER
 
 
 def run_ko(audio, gpu=None, on_progress=None, start_at=0.0, **_):
@@ -291,6 +310,9 @@ _REPEATED_PHRASE = re.compile(
 )
 
 
+LOOP_MARKER = "[반복 인식 오류 · 재변환으로 복구하지 못함]"
+
+
 def _has_transcription_loop(text: str) -> bool:
     # 짧은 숫자열(예: 비트 스터핑 예제)과 일반적인 반복은 유지한다.
     return any(len(match[0]) >= 35 for match in _REPEATED_PHRASE.finditer(text))
@@ -323,7 +345,7 @@ def _retry_openvino_loops(pipe, piece, sr, lang, rows):
                     log(f"반복 인식 구간 재시도 실패: {exc}")
                     text = ""
             if not len(clip) or not text or _has_transcription_loop(text):
-                text = "[반복 인식 오류 · 재변환으로 복구하지 못함]"
+                text = LOOP_MARKER
         yield offset, text
 
 
@@ -418,9 +440,24 @@ def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, 
     raise ValueError(f"알 수 없는 엔진: {engine} (가능: {', '.join(ENGINES)})")
 
 
-def output_path(audio, engine, model="large-v3-turbo") -> Path:
-    suffix = ".whisper.large-v3.txt" if engine == "whisper" and model == "large-v3" else f".{engine}.txt"
-    return Path(audio).with_suffix(suffix)
+DEFAULT_WHISPER_MODEL = "large-v3-turbo"
+
+
+def output_path(audio, engine, model=DEFAULT_WHISPER_MODEL) -> Path:
+    """결과 파일 경로. whisper는 모델마다 결과가 달라서 기본 모델(turbo)이 아니면 모델 이름을 붙임.
+    예: 강의.ko.txt, 강의.whisper.txt(turbo), 강의.whisper.large-v3.txt, 강의.whisper.small.txt"""
+    if engine == "whisper" and model not in (DEFAULT_WHISPER_MODEL, "turbo"):
+        safe = re.sub(r"[^\w.\-]+", "_", Path(str(model)).name) or "custom"
+        return Path(audio).with_suffix(f".whisper.{safe}.txt")
+    return Path(audio).with_suffix(f".{engine}.txt")
+
+
+def finished_outputs(audio) -> list[str]:
+    """이 녹음에 대해 이미 끝난 변환 결과 이름들 (예: ['ko', 'whisper', 'whisper.large-v3'])."""
+    audio = Path(audio)
+    prefix = audio.stem + "."
+    return sorted(p.name[len(prefix):-len(".txt")] for p in audio.parent.glob(f"{glob.escape(audio.stem)}.*.txt")
+                  if p.name[len(prefix):-len(".txt")].split(".")[0] in ENGINES)
 
 
 def format_line(start, text) -> str:

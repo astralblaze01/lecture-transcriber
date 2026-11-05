@@ -165,6 +165,10 @@ def markdown_to_book_html(md_text: str, title: str) -> str:
         if is_item and prev.strip() and not re.match(r"\s*(?:[-*+]|\d+\.)\s", prev) \
                 and not prev.lstrip().startswith(("|", ">")) and not ln.startswith((" ", "\t")):
             fixed.append("")
+        # 빈 줄로만 나뉜 인용 두 개는 Markdown이 한 박스로 합쳐서, 사이에 주석을 넣어 따로 둠
+        if ln.lstrip().startswith(">") and len(fixed) >= 2 and not fixed[-1].strip() \
+                and fixed[-2].lstrip().startswith(">"):
+            fixed += ["<!-- -->", ""]
         fixed.append(ln)
     text = "\n".join(fixed)
 

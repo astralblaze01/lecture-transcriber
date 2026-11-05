@@ -191,9 +191,7 @@ def find_recordings(folder: str = "", limit: int = 15) -> str:
     for f in ranked:
         st = f.stat()
         dur = _duration(f) if f.suffix.lower() in AUDIO_EXTS else None
-        done = [e for e in tr.ENGINES if tr.output_path(f, e).exists()]
-        if tr.output_path(f, "whisper", "large-v3").exists():
-            done.append("whisper:large-v3")
+        done = tr.finished_outputs(f)
         lines.append(
             f"- {f}\n  수정: {datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M}, "
             f"크기: {st.st_size / 1e6:.1f}MB" + (f", 길이: {tr.fmt(dur)}" if dur else "")

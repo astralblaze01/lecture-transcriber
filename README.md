@@ -16,10 +16,11 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 
 - **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe 중 선택 ([변환 엔진](#변환-엔진) 참고)
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
+- **이어하기**: 변환 중 한 줄씩 `.part`에 바로 저장해서, 중간에 꺼도 다음 실행 때 끊긴 지점부터 이어서 변환
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
 - **책 만들기**: 슬라이드 순서를 뼈대로 강의 설명을 풀어 쓴 문서를 `.html`(인쇄용 스타일)과 `.md`로 저장. 강조한 내용은 형광펜, 시험 포인트는 박스로 표시
 - **GPU 가속** · 지원 모델은 NVIDIA CUDA 또는 Intel OpenVINO로 실행합니다.
-- **반복 인식 완화** · OpenVINO에서 같은 단어나 구절이 길게 반복되면 해당 구간을 재시도하고, 복구하지 못한 구간을 표시합니다.
+- **반복 인식 완화** · 같은 단어나 구절이 길게 반복되면(OpenVINO, faster-whisper 모두) 해당 구간만 다시 변환하고, 복구하지 못한 구간은 `[반복 인식 오류 · 재변환으로 복구하지 못함]`으로 표시합니다.
 
 ## 변환 엔진
 
@@ -47,7 +48,7 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 - 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
 - `ko`, `whisper`는 타임스탬프가 붙고, `cohere`는 타임스탬프 없이 문장 단위로만 나와요.
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
-- 정확도 차이는 녹음 상태에 따라 달라요. 같은 녹음을 엔진별로 돌리면 `녹음.ko.txt`, `녹음.whisper.txt`처럼 따로 저장되니 직접 비교해보세요.
+- 정확도 차이는 녹음 상태에 따라 달라요. 결과는 엔진·모델마다 따로 저장되니 같은 녹음을 여러 모델로 돌려 직접 비교해보세요: `녹음.ko.txt`, `녹음.whisper.txt`(large-v3-turbo), `녹음.whisper.large-v3.txt`, `녹음.whisper.small.txt` 등.
 
 ### 노트북 실측
 
@@ -83,7 +84,8 @@ python3 install.py
 녹음 파일 경로를 붙여넣고 모델 번호를 선택합니다. 파일 경로를 인자로 직접 넘길 수도 있습니다. Windows에서 기존 `setup.bat`과 `transcribe_menu.bat`도 사용할 수 있습니다.
 
 - **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko`, `whisper large-v3`, `whisper large-v3-turbo`에서 사용합니다.
-- **NVIDIA GPU** · 지원 드라이버와 CTranslate2용 CUDA 라이브러리가 준비된 환경에서 사용합니다. Windows의 기존 `setup.bat`은 CUDA 라이브러리 설치를 시도합니다.
+- **NVIDIA GPU** · x86-64 Windows/Linux에서 설치 명령에 `--nvidia-gpu`를 추가하면 CTranslate2용 cuBLAS·cuDNN을 pip로 설치합니다(CUDA Toolkit 불필요, 최신 드라이버 필요). Windows의 기존 `setup.bat`은 `nvidia-smi`가 있으면 자동으로 설치합니다.
+- **모델 미리 준비** · `install.py`는 한국어 모델을 설치 중에 미리 내려받아 변환합니다(`--intel-gpu`면 OpenVINO 형식까지). 첫 변환이 멈춘 것처럼 보이지 않게 하려는 것이고, 나중으로 미루려면 `--skip-models`를 붙이세요.
 - **macOS** · 현재 이 프로젝트는 CPU 경로로 실행합니다.
 - **Claude Desktop** · Windows/macOS에서 설치 명령에 `--register-claude`를 추가한 뒤 앱을 완전히 종료하고 다시 실행합니다.
 - **Linux MCP 클라이언트** · stdio 서버로 등록합니다. 실행 명령에는 가상환경 Python의 절대 경로, 인자에는 `transcribe_mcp.py`의 절대 경로를 지정합니다.
@@ -111,6 +113,15 @@ Windows 예시입니다. macOS와 Linux에서는 Python 경로를 `.venv/bin/pyt
 ```
 .venv\Scripts\python transcribe.py 녹음.m4a
 .venv\Scripts\python transcribe.py lecture.mp4 --engine whisper --model large-v3 --lang ko --gpu
+```
+
+## 테스트
+
+모델 없이 핵심 동작(결과 파일 이름, 반복 인식 복구, 이어하기, 녹음 자르기, 삼성노트 풀기, 책 HTML)을 확인합니다.
+
+```bash
+pip install pytest
+python -m pytest -q tests
 ```
 
 ## 구조
