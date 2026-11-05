@@ -1,7 +1,7 @@
 """
 Claude 데스크톱 앱 설정(claude_desktop_config.json)에 transcriber MCP 서버를 등록.
 기존 설정은 .bak으로 백업하고, 다른 MCP 서버 설정은 그대로 둠.
-setup.bat이 가상환경의 python으로 실행하므로, 그 python 경로가 그대로 등록됨.
+실행에 사용한 가상환경 Python 경로를 등록한다.
 """
 import glob
 import json
@@ -16,6 +16,10 @@ NAME = "transcriber"
 
 
 def config_dirs():
+    if sys.platform == "darwin":
+        return [Path.home() / "Library" / "Application Support" / "Claude"]
+    if sys.platform != "win32":
+        return []
     dirs = []
     appdata = os.environ.get("APPDATA")
     if appdata:
@@ -37,7 +41,7 @@ def main():
     }
     targets = config_dirs()
     if not targets:
-        sys.exit("APPDATA 경로를 찾지 못했어요. README의 수동 등록 방법을 써주세요.")
+        sys.exit("Claude 데스크톱 설정 위치를 찾을 수 없습니다. 사용 중인 MCP 클라이언트 설정에 transcribe_mcp.py를 등록하세요.")
 
     for d in targets:
         d.mkdir(parents=True, exist_ok=True)

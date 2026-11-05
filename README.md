@@ -8,7 +8,7 @@
 
 ## 모델 직접 선택
 
-`transcribe_menu.bat`을 실행하거나 녹음 파일을 그 위에 끌어다 놓으면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
+공통 실행 옵션 `--choose-model`을 사용하면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
 
 Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. `large-v3`는 `engine="whisper", model="large-v3"`로 전달됩니다.
 
@@ -49,18 +49,43 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
 - 정확도 차이는 녹음 상태에 따라 달라요. 같은 녹음을 엔진별로 돌리면 `녹음.ko.txt`, `녹음.whisper.txt`처럼 따로 저장되니 직접 비교해보세요.
 
-### 변환 시간 예시
+### 노트북 실측
 
-Intel Arc 140V에서 Whisper `large-v3`로 강의 녹음 61분 11초를 **7분 8초**에 처리했습니다. 설치를 마친 모델의 로딩 시간은 포함했고, 다운로드와 형식 변환 시간은 제외했습니다. 같은 속도로 환산하면 2시간은 약 14분입니다. 녹음의 언어, 발화 밀도, 장치에 따라 시간이 달라집니다.
+삼성 노트북(시스템 모델 `960XHA`), Intel Core Ultra 7 258V(8코어), Intel Arc 140V, RAM 32GB, Windows 11에서 측정했습니다. 같은 한국어 강의의 9:00–12:00 구간으로 첫 실행과 모델 재사용을 각각 한 번 측정했고, 모델 다운로드와 최초 형식 변환은 제외했습니다.
 
-## 설치 (Windows)
+| 모델 | 장치 | 3분 녹음 첫 실행 | 3분 녹음 모델 재사용 | 2시간 환산 |
+|---|---|---:|---:|---:|
+| BatiSay KO Turbo | Intel Arc · OpenVINO FP16 | 17.00초 | 5.87초 | 약 4분 |
+| Whisper `large-v3` | Intel Arc · OpenVINO FP16 | 57.56초 | 38.13초 | 약 25분 |
+| Whisper `large-v3-turbo` | CPU · faster-whisper INT8 | 93.46초 | 105.46초 | 약 70분 |
 
-1. Python 3.10+ 설치 (설치할 때 "Add python.exe to PATH" 체크)
-2. 이 저장소를 받아서 오래 둘 폴더에 둬요 (예: `C:\tools\lecture-transcriber`)
-3. `setup.bat` 실행 — 가상환경, 패키지, 한국어 모델 변환, Claude 데스크톱 설정 등록까지 자동 (최초 10~15분)
-4. Claude 데스크톱 앱을 트레이에서 완전히 종료 후 다시 실행
+2시간 환산은 모델을 불러둔 상태의 3분 측정값을 40배 한 값입니다. 별도의 실제 강의에서 `large-v3`는 **61분 11초를 7분 8초**에 변환했습니다(모델 로딩 포함, 같은 속도라면 2시간 약 14분). 녹음의 발화 밀도, 잡음, 재시도에 따라 실제 속도가 달라집니다. Cohere 엔진은 별도 모델 접근과 의존성이 필요해 측정하지 않았습니다.
 
-인터넷에서 받은 `.bat`이라 SmartScreen이 막으면 "추가 정보 → 실행"을 누르거나, zip 파일 속성에서 "차단 해제"를 체크한 뒤 압축을 풀어요.
+## 설치와 실행
+
+Python 3.10 이상이 필요합니다. Linux에서 가상환경을 만들 수 없다면 배포판의 Python venv 패키지를 설치하세요. Windows, macOS, Linux에서 저장소 폴더를 연 뒤 아래 명령으로 가상환경과 패키지를 설치합니다.
+
+**Windows (PowerShell)**
+
+```powershell
+python install.py
+.venv\Scripts\python.exe transcribe.py --choose-model
+```
+
+**macOS / Linux**
+
+```bash
+python3 install.py
+.venv/bin/python transcribe.py --choose-model
+```
+
+녹음 파일 경로를 붙여넣고 모델 번호를 선택합니다. 파일 경로를 인자로 직접 넘길 수도 있습니다. Windows에서 기존 `setup.bat`과 `transcribe_menu.bat`도 사용할 수 있습니다.
+
+- **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko`와 `whisper large-v3`에서 사용합니다.
+- **NVIDIA GPU** · 지원 드라이버와 CTranslate2용 CUDA 라이브러리가 준비된 환경에서 사용합니다. Windows의 기존 `setup.bat`은 CUDA 라이브러리 설치를 시도합니다.
+- **macOS** · 현재 이 프로젝트는 CPU 경로로 실행합니다.
+- **Claude Desktop** · Windows/macOS에서 설치 명령에 `--register-claude`를 추가한 뒤 앱을 완전히 종료하고 다시 실행합니다.
+- **Linux MCP 클라이언트** · stdio 서버로 등록합니다. 실행 명령에는 가상환경 Python의 절대 경로, 인자에는 `transcribe_mcp.py`의 절대 경로를 지정합니다.
 
 ## 사용 예 (Claude 데스크톱 앱)
 
@@ -79,6 +104,8 @@ Intel Arc 140V에서 Whisper `large-v3`로 강의 녹음 61분 11초를 **7분 8
 | `save_book` | 원고를 `.md` + `.html`로 저장 (처리한 노트 폴더에만 쓰기 허용) |
 
 ## 명령줄로 쓰기
+
+Windows 예시입니다. macOS와 Linux에서는 Python 경로를 `.venv/bin/python`으로 바꿉니다.
 
 ```
 .venv\Scripts\python transcribe.py 녹음.m4a
