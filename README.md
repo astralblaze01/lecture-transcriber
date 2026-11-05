@@ -38,12 +38,12 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 | GPU | 방식 | 지원 엔진 | 설치 |
 |---|---|---|---|
 | NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16) | `ko`, `whisper` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
-| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko`, `whisper`의 `large-v3` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
+| 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
 | AMD Radeon | 아직 미지원 (CPU로 동작) | — | — |
 
 자동 순서는 NVIDIA → 인텔 GPU → CPU이고, GPU에서 시작이 안 되면 CPU로 넘어가요. `--cpu`로 CPU를 강제할 수 있어요. 인텔 GPU 경로는 긴 녹음을 조용한 틈에서 약 5분씩 잘라 처리하고 타임스탬프를 이어 붙여요.
 
-- Intel GPU에서 `large-v3`를 처음 사용하면 약 3.1GB의 모델을 내려받아 OpenVINO로 변환합니다. 이후에는 저장된 모델을 재사용합니다.
+- Intel GPU에서 일반 Whisper 모델을 처음 사용하면 `large-v3`는 약 3.1GB, `large-v3-turbo`는 약 1.6GB의 가중치를 내려받아 OpenVINO로 변환합니다. 이후에는 저장된 모델을 재사용합니다.
 - 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
 - `ko`, `whisper`는 타임스탬프가 붙고, `cohere`는 타임스탬프 없이 문장 단위로만 나와요.
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
@@ -57,6 +57,7 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 |---|---|---:|---:|---:|
 | BatiSay KO Turbo | Intel Arc · OpenVINO FP16 | 17.00초 | 5.87초 | 약 4분 |
 | Whisper `large-v3` | Intel Arc · OpenVINO FP16 | 57.56초 | 38.13초 | 약 25분 |
+| Whisper `large-v3-turbo` | Intel Arc · OpenVINO FP16 | 19.83초 | 9.94초 | 약 7분 |
 | Whisper `large-v3-turbo` | CPU · faster-whisper INT8 | 93.46초 | 105.46초 | 약 70분 |
 
 2시간 환산은 모델을 불러둔 상태의 3분 측정값을 40배 한 값입니다. 별도의 실제 강의에서 `large-v3`는 **61분 11초를 7분 8초**에 변환했습니다(모델 로딩 포함, 같은 속도라면 2시간 약 14분). 녹음의 발화 밀도, 잡음, 재시도에 따라 실제 속도가 달라집니다. Cohere 엔진은 별도 모델 접근과 의존성이 필요해 측정하지 않았습니다.
@@ -81,7 +82,7 @@ python3 install.py
 
 녹음 파일 경로를 붙여넣고 모델 번호를 선택합니다. 파일 경로를 인자로 직접 넘길 수도 있습니다. Windows에서 기존 `setup.bat`과 `transcribe_menu.bat`도 사용할 수 있습니다.
 
-- **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko`와 `whisper large-v3`에서 사용합니다.
+- **Intel GPU** · x86-64 Windows/Linux에서 설치 명령에 `--intel-gpu`를 추가합니다. 호환 드라이버가 설치돼 있어야 하며, `ko`, `whisper large-v3`, `whisper large-v3-turbo`에서 사용합니다.
 - **NVIDIA GPU** · 지원 드라이버와 CTranslate2용 CUDA 라이브러리가 준비된 환경에서 사용합니다. Windows의 기존 `setup.bat`은 CUDA 라이브러리 설치를 시도합니다.
 - **macOS** · 현재 이 프로젝트는 CPU 경로로 실행합니다.
 - **Claude Desktop** · Windows/macOS에서 설치 명령에 `--register-claude`를 추가한 뒤 앱을 완전히 종료하고 다시 실행합니다.

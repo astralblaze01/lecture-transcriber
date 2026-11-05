@@ -183,6 +183,12 @@ def run_ko(audio, gpu=None, on_progress=None, start_at=0.0, **_):
 # ---------- 인텔 GPU (OpenVINO) ----------
 KO_OV_DIR = HERE / "models" / "batisay-ko-turbo-ov"
 LARGE_V3_OV_DIR = HERE / "models" / "whisper-large-v3-ov"
+LARGE_V3_TURBO_OV_DIR = HERE / "models" / "whisper-large-v3-turbo-ov"
+_WHISPER_OV_DIRS = {
+    "large-v3": LARGE_V3_OV_DIR,
+    "large-v3-turbo": LARGE_V3_TURBO_OV_DIR,
+    "turbo": LARGE_V3_TURBO_OV_DIR,
+}
 
 
 class _OVStartError(RuntimeError):
@@ -349,14 +355,15 @@ def run_openvino(audio, model_dir, lang="ko", device=None, on_progress=None, sta
             on_progress(min((start_at + b) / total, 1.0))
 
 
-def _run_large_v3_openvino(audio, lang, gpu, on_progress, start_at):
+def _run_whisper_openvino(audio, lang, model, gpu, on_progress, start_at):
+    repo_model = "large-v3-turbo" if model == "turbo" else model
     try:
-        model_dir = _ensure_ov_model("openai/whisper-large-v3", LARGE_V3_OV_DIR)
+        model_dir = _ensure_ov_model(f"openai/whisper-{repo_model}", _WHISPER_OV_DIRS[model])
         yield from run_openvino(audio, model_dir, lang, on_progress=on_progress, start_at=start_at)
         return
     except _OVStartError as exc:
-        log(f"large-v3 인텔 GPU 시작 실패, CPU로 전환: {exc}")
-    yield from run_whisper(audio, lang, "large-v3", gpu, on_progress, start_at)
+        log(f"{model} 인텔 GPU 시작 실패, CPU로 전환: {exc}")
+    yield from run_whisper(audio, lang, model, gpu, on_progress, start_at)
 
 
 def run_cohere(audio, lang="ko", on_progress=None, **_):
@@ -403,8 +410,8 @@ def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, 
     if engine == "ko":
         return run_ko(audio, gpu=gpu, on_progress=on_progress, start_at=start_at)
     if engine == "whisper":
-        if model == "large-v3" and gpu is not False and not cuda_available() and intel_gpu_available():
-            return _run_large_v3_openvino(audio, lang, gpu, on_progress, start_at)
+        if model in _WHISPER_OV_DIRS and gpu is not False and not cuda_available() and intel_gpu_available():
+            return _run_whisper_openvino(audio, lang, model, gpu, on_progress, start_at)
         return run_whisper(audio, lang, model, gpu, on_progress, start_at)
     if engine == "cohere":
         return run_cohere(audio, lang, on_progress=on_progress)
@@ -485,7 +492,7 @@ def main():
             "2": ("whisper", "large-v3"),
             "3": ("whisper", "large-v3-turbo"),
         }
-        print("1. 한국어 특화 BatiSay Turbo\n2. Whisper large-v3 (Intel GPU 지원)\n3. Whisper large-v3-turbo")
+        print("1. 한국어 특화 BatiSay Turbo\n2. Whisper large-v3 (Intel GPU 지원)\n3. Whisper large-v3-turbo (Intel GPU 지원)")
         choice = input("모델 번호 [1]: ").strip() or "1"
         if choice not in choices:
             p.error("모델 번호는 1, 2, 3 중 하나여야 합니다.")
