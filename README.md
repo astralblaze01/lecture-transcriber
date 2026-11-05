@@ -8,11 +8,27 @@ Claude는 오디오를 직접 입력으로 받지 못해서, 음성 인식은 �
 
 ## 기능
 
-- **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe 중 선택
+- **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe 중 선택 ([변환 엔진](#변환-엔진) 참고)
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
 - **책 만들기**: 슬라이드 순서를 뼈대로 강의 설명을 풀어 쓴 문서를 `.html`(인쇄용 스타일)과 `.md`로 저장. 강조한 내용은 형광펜, 시험 포인트는 박스로 표시
 - GPU 없이 노트북 CPU(int8)로 동작
+
+## 변환 엔진
+
+`--engine`(명령줄) 또는 `engine`(MCP 도구 인자)으로 고를 수 있어요.
+
+| 엔진 | 모델 | 실행기 | 노트북 CPU | 이럴 때 |
+|---|---|---|---|---|
+| `ko` (기본) | [batiai/batisay-ko-turbo](https://huggingface.co/batiai/batisay-ko-turbo) — Whisper large-v3-turbo를 한국어로 파인튜닝 | faster-whisper (int8) | 빠름 | 한국어 강의·회의 |
+| `whisper` | OpenAI Whisper (`--model`로 tiny ~ large-v3-turbo 선택) | faster-whisper (int8) | 빠름 | 영어 등 다른 언어, 여러 언어가 섞인 녹음 |
+| `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 |
+
+**faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 일반 Whisper와 같은 속도로 한국어 정확도를 더 얻을 수 있어요.
+
+- `ko`, `whisper`는 타임스탬프가 붙고, `cohere`는 타임스탬프 없이 문장 단위로만 나와요.
+- `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
+- 정확도 차이는 녹음 상태에 따라 달라요. 같은 녹음을 엔진별로 돌리면 `녹음.ko.txt`, `녹음.whisper.txt`처럼 따로 저장되니 직접 비교해보세요.
 
 ## 설치 (Windows)
 
