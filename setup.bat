@@ -24,7 +24,7 @@ set PY=.venv\Scripts\python.exe
 
 echo [2/5] 패키지 설치 중... (몇 분 걸려요)
 %PY% -m pip install --upgrade pip -q || goto :fail
-%PY% -m pip install -q faster-whisper "mcp[cli]" huggingface_hub "transformers>=4.40,<5" pypdf markdown || goto :fail
+%PY% -m pip install -q faster-whisper "mcp[cli]" huggingface_hub "transformers>=4.40,<5" pypdf markdown "av<19" || goto :fail
 
 echo [3/5] PyTorch(CPU) 설치 중... (한국어 모델 변환에만 쓰여요)
 %PY% -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu || goto :fail
