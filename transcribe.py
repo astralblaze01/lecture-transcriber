@@ -1,24 +1,27 @@
 """
-녹음 파일 → 텍스트 변환 (로컬 실행, 엔진 3종 선택)
+녹음 파일 → 텍스트 변환 (로컬 실행, 엔진 4종 선택)
 명령줄에서 직접 써도 되고, transcribe_mcp.py가 이 파일을 불러서 Claude에 연결해요.
 
 엔진
   ko      : batiai/batisay-ko-turbo (Whisper turbo 한국어 파인튜닝, 타임스탬프 O) ← 한국어 추천
   whisper : faster-whisper 기본 모델 (다국어, 타임스탬프 O)
   cohere  : CohereLabs/cohere-transcribe-03-2026 (오픈 ASR 리더보드 1위, 약 20초 단위 타임스탬프, GPU 권장)
+  qwen    : Qwen/Qwen3-ASR-1.7B (52개 언어·방언, 약 30초 단위 타임스탬프, Apple Silicon은 MLX로 실행)
 
 사용
   python transcribe.py 녹음.m4a                       # ko 엔진
   python transcribe.py 녹음.m4a --engine whisper --model large-v3-turbo --lang en
   python transcribe.py 녹음.m4a --engine cohere
+  python transcribe.py 녹음.m4a --engine qwen
   (GPU 자동 사용: Apple Silicon Mac → MLX, NVIDIA → CUDA, 인텔 내장/Arc → OpenVINO,
    그 밖의 DX12 GPU(AMD 등) → DirectML, 없으면 CPU. --cpu로 끌 수 있음)
 결과
   녹음.<engine>.txt 가 같은 폴더에 생성
 
 cohere 엔진은 추가 설치가 필요해요:
-  pip install "transformers>=5.4.0" accelerate librosa soundfile sentencepiece protobuf
+  pip install accelerate librosa soundfile sentencepiece protobuf
   + https://huggingface.co/CohereLabs/cohere-transcribe-03-2026 에서 약관 동의 후 `hf auth login`
+qwen 엔진은 transformers 5.14 이상(기본 설치에 포함)으로 돌고, Apple Silicon에서는 mlx-audio를 씀.
 """
 import argparse
 import glob
@@ -32,7 +35,7 @@ HERE = Path(__file__).resolve().parent
 KO_REPO = "batiai/batisay-ko-turbo"
 KO_DIR = HERE / "models" / "batisay-ko-turbo-ct2"
 
-ENGINES = ("ko", "whisper", "cohere")
+ENGINES = ("ko", "whisper", "cohere", "qwen")
 
 # 진행 메시지는 전부 stderr로 (MCP는 stdout을 통신용으로 쓰기 때문)
 def log(*a):
@@ -822,6 +825,105 @@ def run_cohere(audio, lang="ko", on_progress=None, start_at=0.0, **_):
             on_progress(min((start_at + batch[-1][1]) / total, 1.0))
 
 
+# ---------- Qwen3-ASR ----------
+# 모델이 타임스탬프를 주지 않아서 cohere처럼 조용한 틈에서 약 30초씩 잘라 조각 시작 시각을 붙임.
+# 말소리가 없는 조각은 건너뛰고, 조각 앞뒤 무음은 잘라서 시각이 말 시작에 맞게 함.
+QWEN_REPO = "Qwen/Qwen3-ASR-1.7B-hf"                  # transformers(CPU·CUDA)용 공식 변환본
+QWEN_MLX_REPO = "mlx-community/Qwen3-ASR-1.7B-8bit"   # Apple Silicon(MLX)용
+QWEN_PIECE_S = 30
+QWEN_MAX_TOKENS = 512
+
+
+def _qwen_language(lang):
+    """언어 코드('ko')나 이름('Korean')을 Qwen3-ASR이 쓰는 이름으로."""
+    try:
+        from transformers.models.qwen3_asr.processing_qwen3_asr import LANGUAGE_CODE_TO_NAME
+    except ImportError as exc:
+        raise RuntimeError("qwen 엔진에는 transformers 5.14 이상이 필요해요: "
+                           'pip install -U "transformers>=5.14"') from exc
+    if lang in LANGUAGE_CODE_TO_NAME:
+        return LANGUAGE_CODE_TO_NAME[lang]
+    names = {n.lower(): n for n in LANGUAGE_CODE_TO_NAME.values()}
+    if str(lang).lower() in names:
+        return names[str(lang).lower()]
+    raise ValueError(f"qwen 엔진이 지원하지 않는 언어: {lang} (가능: {', '.join(sorted(LANGUAGE_CODE_TO_NAME))})")
+
+
+def _qwen_mlx():
+    """Apple Silicon GPU용 Qwen3-ASR. (조각 → 텍스트) 함수를 돌려줌."""
+    from mlx_audio.stt.utils import load_model
+
+    key = ("qwen-mlx", QWEN_MLX_REPO)
+    with _models_lock:
+        if key not in _models:
+            log(f"모델 로드 중: {QWEN_MLX_REPO} (Apple GPU, MLX)")
+            _models[key] = load_model(QWEN_MLX_REPO)
+    model = _models[key]
+
+    def run(piece, language):
+        with _models_lock:
+            out = model.generate(piece, language=language, max_tokens=QWEN_MAX_TOKENS)
+        return (out.text or "").strip()
+    return run
+
+
+def _qwen_torch(gpu=None):
+    """transformers용 Qwen3-ASR (NVIDIA GPU가 있으면 CUDA, 아니면 CPU)."""
+    import torch
+    from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
+
+    device = "cuda" if gpu is not False and torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    key = ("qwen-hf", QWEN_REPO, device)
+    with _models_lock:
+        if key not in _models:
+            log(f"모델 로드 중: {QWEN_REPO} ({device})")
+            processor = AutoProcessor.from_pretrained(QWEN_REPO)
+            model = Qwen3ASRForConditionalGeneration.from_pretrained(QWEN_REPO, dtype=dtype)
+            _models[key] = (processor, model.to(device).eval())
+    processor, model = _models[key]
+
+    def run(piece, language):
+        inputs = processor.apply_transcription_request(piece, language=language).to(device, dtype)
+        with torch.inference_mode():
+            ids = model.generate(**inputs, max_new_tokens=QWEN_MAX_TOKENS)
+        out = processor.decode(ids[:, inputs["input_ids"].shape[1]:], return_format="parsed")
+        out = out[0] if isinstance(out, list) else out
+        return (out.get("transcription") or "").strip()
+    return run
+
+
+def run_qwen(audio, lang="ko", gpu=None, on_progress=None, start_at=0.0, **_):
+    language = _qwen_language(lang)
+    run = None
+    if gpu_backend(gpu) == "mlx":
+        try:
+            run = _qwen_mlx()
+        except Exception as exc:  # noqa: BLE001  (설치·내려받기 문제면 CPU로)
+            log(f"Qwen3-ASR을 Apple GPU(MLX)로 시작하지 못해 CPU로 바꿔요: {type(exc).__name__}: {exc}")
+    if run is None:
+        run = _qwen_torch(gpu)
+
+    wav, total = _decode_from(audio, start_at)
+    spans = _speech_spans(wav, SR)
+    cuts = _cut_points(wav, SR, target_s=QWEN_PIECE_S, spans=spans)
+    for a, b in zip(cuts, cuts[1:]):
+        clips = _clips_in(spans, a, b, join=QWEN_PIECE_S) if spans is not None else [[0.0, b - a]]
+        if clips:
+            s, e = clips[0][0], clips[-1][1]
+            piece = wav[int((a + s) * SR):int((a + e) * SR)]
+            text = run(piece, language)
+            if _has_transcription_loop(text):
+                # 반복 인식이 나면 조각을 반으로 나눠 다시 시도
+                halves = [h for h in _split_in_half(piece) if len(h)]
+                retry = " ".join(run(h, language) for h in halves).strip()
+                text = retry if retry and not _has_transcription_loop(retry) else LOOP_MARKER
+            if text:
+                yield start_at + a + s, text
+        if on_progress and total:
+            on_progress(min((start_at + b) / total, 1.0))
+
+
 def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, on_progress=None,
                start_at=0.0):
     """엔진을 골라 (시작초, 텍스트)를 차례로 돌려줌. start_at초부터 시작할 수 있음(이어하기용)."""
@@ -842,6 +944,8 @@ def transcribe(audio, engine="ko", lang="ko", model="large-v3-turbo", gpu=None, 
         return run_whisper(audio, lang, model, gpu, on_progress, start_at)
     if engine == "cohere":
         return run_cohere(audio, lang, on_progress=on_progress, start_at=start_at)
+    if engine == "qwen":
+        return run_qwen(audio, lang, gpu, on_progress=on_progress, start_at=start_at)
     raise ValueError(f"알 수 없는 엔진: {engine} (가능: {', '.join(ENGINES)})")
 
 
@@ -991,6 +1095,17 @@ def _dir_size_gb(d: Path) -> float:
     return sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9
 
 
+def qwen_status() -> str:
+    """qwen 엔진을 어떤 방식으로 돌릴 수 있는지 (자가 진단용)."""
+    try:
+        _qwen_language("ko")
+    except RuntimeError:
+        return "사용 불가 — transformers 5.14 이상 필요"
+    if gpu_backend(None) == "mlx" and _version("mlx-audio"):
+        return "Apple GPU(MLX, mlx-audio)"
+    return "transformers (CUDA 또는 CPU)"
+
+
 def doctor(run_test: bool = True) -> str:
     """설치·장치 상태를 점검하고, 고른 가속 방식으로 실제로 짧은 변환을 돌려 확인."""
     import platform
@@ -999,7 +1114,7 @@ def doctor(run_test: bool = True) -> str:
     import wave
 
     lines = [f"Python {platform.python_version()} · {platform.system()} {platform.release()} ({platform.machine()})"]
-    pkgs = ["faster-whisper", "ctranslate2", "av", "mlx", "mlx-whisper", "openvino", "openvino-genai", "onnxruntime",
+    pkgs = ["faster-whisper", "ctranslate2", "av", "mlx", "mlx-whisper", "mlx-audio", "openvino", "openvino-genai", "onnxruntime",
             "onnxruntime-directml", "optimum", "optimum-intel", "optimum-onnx", "transformers", "torch"]
     lines.append("패키지: " + ", ".join(f"{p} {v}" for p in pkgs if (v := _version(p))))
 
@@ -1019,6 +1134,7 @@ def doctor(run_test: bool = True) -> str:
     ]
     backend = gpu_backend(None)
     lines.append(f"자동 선택: {backend}")
+    lines.append(f"qwen 엔진: {qwen_status()}")
     lines.append(f"결과 저장 폴더: {output_root()}")
 
     models = {"ko (CPU·CUDA)": KO_DIR, "ko (Apple GPU)": KO_MLX_DIR, "ko (인텔 GPU)": KO_OV_DIR, "ko (DirectML)": KO_ONNX_DIR,
@@ -1101,11 +1217,13 @@ def main():
             "1": ("ko", "large-v3-turbo"),
             "2": ("whisper", "large-v3"),
             "3": ("whisper", "large-v3-turbo"),
+            "4": ("qwen", "large-v3-turbo"),
         }
-        print("1. 한국어 특화 BatiSay Turbo\n2. Whisper large-v3 (Intel GPU 지원)\n3. Whisper large-v3-turbo (Intel GPU 지원)")
+        print("1. 한국어 특화 BatiSay Turbo\n2. Whisper large-v3 (Intel GPU 지원)\n3. Whisper large-v3-turbo (Intel GPU 지원)\n"
+              "4. Qwen3-ASR 1.7B (Apple Silicon은 MLX)")
         choice = input("모델 번호 [1]: ").strip() or "1"
         if choice not in choices:
-            p.error("모델 번호는 1, 2, 3 중 하나여야 합니다.")
+            p.error("모델 번호는 1, 2, 3, 4 중 하나여야 합니다.")
         a.engine, a.model = choices[choice]
     if not a.audio or not Path(a.audio).is_file():
         p.error("존재하는 녹음 파일 경로를 입력하세요.")

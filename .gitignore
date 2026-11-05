@@ -1,4 +1,5 @@
 *.cohere.txt
+*.qwen.txt
 *.ko.txt
 *.m4a
 *.mp3

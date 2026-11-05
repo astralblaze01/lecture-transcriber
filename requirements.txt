@@ -1,7 +1,7 @@
 faster-whisper
 mcp[cli]
 huggingface_hub
-transformers>=4.51,<5
+transformers>=5.14
 pypdf
 markdown
 av<19

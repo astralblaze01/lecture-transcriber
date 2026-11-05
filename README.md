@@ -8,13 +8,13 @@
 
 ## 모델 직접 선택
 
-공통 실행 옵션 `--choose-model`을 사용하면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
+공통 실행 옵션 `--choose-model`을 사용하면 한국어 특화 BatiSay Turbo, Whisper large-v3, Whisper large-v3-turbo, Qwen3-ASR 1.7B 중 하나를 번호로 고를 수 있습니다. 메뉴의 기본 언어는 한국어입니다. `large-v3` 결과는 `녹음.whisper.large-v3.txt`로 따로 저장됩니다.
 
 Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 지정하세요. 일반 녹음과 삼성 노트 모두에서 선택할 수 있습니다. `large-v3`는 `engine="whisper", model="large-v3"`로 전달됩니다.
 
 ## 기능
 
-- **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe 중 선택 ([변환 엔진](#변환-엔진) 참고)
+- **녹음 → 텍스트**: 한국어 파인튜닝 Whisper(기본), 다국어 Whisper, Cohere Transcribe, Qwen3-ASR 중 선택 ([변환 엔진](#변환-엔진) 참고)
 - **긴 녹음 대응**: 백그라운드 작업 + 진행률 조회로 도구 호출 타임아웃 회피, 결과 캐시
 - **이어하기**: 변환 중 한 줄씩 `.part`에 바로 저장해서, 중간에 꺼도 다음 실행 때 끊긴 지점부터 이어서 변환
 - **삼성노트(.sdocx) 처리**: 압축을 풀고 파일 시그니처로 녹음·PDF를 골라냄
@@ -30,7 +30,8 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 |---|---|---|---|---|
 | `ko` (기본) | [batiai/batisay-ko-turbo](https://huggingface.co/batiai/batisay-ko-turbo) — Whisper large-v3-turbo를 한국어로 파인튜닝 | faster-whisper (int8) | 빠름 | 한국어 강의·회의 |
 | `whisper` | OpenAI Whisper (`--model`로 `large-v3`, `large-v3-turbo` 등 선택) | faster-whisper (int8) | 빠름 | 영어 등 다른 언어, 여러 언어가 섞인 녹음 |
-| `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 (`transformers>=5.4` 필요) |
+| `cohere` | [CohereLabs/cohere-transcribe-03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 공개 당시 Open ASR 리더보드 1위 | transformers | 매우 느림, GPU 권장 | GPU가 있고 정확도를 최대로 원할 때 |
+| `qwen` | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) — 52개 언어·방언, 노래·배경음악 섞인 음성도 인식 | transformers (Apple Silicon은 mlx-audio) | 보통 (1.7B, float32) | 여러 언어가 섞였거나 Whisper 결과가 아쉬울 때 |
 
 **faster-whisper는 모델이 아니라 실행기**예요. Whisper 계열 모델을 CTranslate2 형식으로 바꿔서 CPU에서도 빠르게 돌려줘요. `ko` 엔진은 한국어 파인튜닝 모델을 `setup.bat`이 최초 1회 이 형식(int8)으로 변환해서 쓰기 때문에, 한국어 녹음에 맞춘 모델을 사용할 수 있어요.
 
@@ -38,8 +39,8 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 
 | GPU | 방식 | 지원 엔진 | 설치 |
 |---|---|---|---|
-| Apple Silicon (M1 이상 Mac) | mlx-whisper (fp16, Metal) | `ko`, `whisper` | `install.py`(또는 `setup.sh`)가 자동으로 mlx-whisper를 설치하고 한국어 모델을 MLX 형식으로 1회 변환. `whisper` 엔진은 [mlx-community](https://huggingface.co/mlx-community) 변환본을 받아 씀 |
-| NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16) | `ko`, `whisper` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
+| Apple Silicon (M1 이상 Mac) | mlx-whisper (fp16, Metal), Qwen3-ASR은 mlx-audio (8bit) | `ko`, `whisper`, `qwen` | `install.py`(또는 `setup.sh`)가 자동으로 mlx-whisper·mlx-audio를 설치하고 한국어 모델을 MLX 형식으로 1회 변환. `whisper` 엔진은 [mlx-community](https://huggingface.co/mlx-community) 변환본을 받아 씀 |
+| NVIDIA (GeForce RTX/GTX) | faster-whisper + CUDA (float16), `qwen`·`cohere`는 PyTorch | `ko`, `whisper`, `qwen`, `cohere` | `setup.bat`이 `nvidia-smi`를 찾으면 cuBLAS·cuDNN을 pip로 설치 (CUDA Toolkit 불필요) |
 | 인텔 내장(Iris Xe, Arc 내장) · Arc 외장 | OpenVINO GenAI (fp16) | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `setup.bat`이 인텔 그래픽을 찾으면 OpenVINO를 설치하고 한국어 모델을 OpenVINO 형식으로 1회 변환 |
 | AMD Radeon 등 DX12 GPU (Windows) | ONNX Runtime + DirectML | `ko`, `whisper`의 `large-v3`·`large-v3-turbo` | `install.py --amd-gpu` 또는 `setup.bat`(AMD 그래픽만 있을 때 자동). 모델을 ONNX로 1회 변환 |
 
@@ -51,7 +52,9 @@ Claude에서는 “Whisper large-v3로 변환해줘”처럼 모델 이름을 �
 
 - Intel GPU에서 일반 Whisper 모델을 처음 사용하면 `large-v3`는 약 3.1GB, `large-v3-turbo`는 약 1.6GB의 가중치를 내려받아 OpenVINO로 변환합니다. 이후에는 저장된 모델을 재사용합니다.
 - 기존 결과를 다시 변환하려면 MCP에서 `force=true`, 명령줄에서는 `--force`를 지정하세요.
-- `ko`, `whisper`는 문장마다 타임스탬프가 붙어요. `cohere`는 모델이 타임스탬프를 주지 않아서 녹음을 조용한 틈에서 약 20초씩 잘라 조각마다 변환하고, 조각 시작 시각을 붙여요. 덕분에 `cohere`도 이어하기와 반복 복구가 돼요.
+- `ko`, `whisper`는 문장마다 타임스탬프가 붙어요. `cohere`·`qwen`은 모델이 타임스탬프를 주지 않아서 녹음을 조용한 틈에서 잘라(`cohere` 약 20초, `qwen` 약 30초) 조각마다 변환하고, 조각 시작 시각을 붙여요. 덕분에 이어하기와 반복 복구가 돼요. `qwen`은 말소리가 없는 조각을 건너뛰어요.
+- `qwen`은 Apple Silicon에서 mlx-community의 8bit 변환본(약 2.5GB), 그 밖에서는 공식 transformers 변환본 `Qwen/Qwen3-ASR-1.7B-hf`(약 4.1GB)를 처음 쓸 때 내려받아요. 7분짜리 한국어 합성 음성 기준으로 MLX는 약 19초, 같은 Mac의 CPU는 약 77초 걸렸어요(Apple M5 · 24GB, 모델 로드 포함).
+- `qwen`은 `transformers` 5.14 이상이 필요해요(기본 설치에 포함). `--intel-gpu`·`--amd-gpu` 설치는 OpenVINO·ONNX 변환기 때문에 transformers를 4.x로 내려서 `qwen`을 쓸 수 없어요.
 - `cohere`는 언어 자동 감지가 없어 `--lang`/`language`를 맞게 줘야 하고, 추가 설치와 Hugging Face 약관 동의가 필요해요 (`transcribe.py` 맨 위 주석 참고).
 - 정확도 차이는 녹음 상태에 따라 달라요. 결과는 엔진·모델마다 따로 저장되니 같은 녹음을 여러 모델로 돌려 직접 비교해보세요: `녹음.ko.txt`, `녹음.whisper.txt`(large-v3-turbo), `녹음.whisper.large-v3.txt`, `녹음.whisper.small.txt` 등.
 
@@ -168,6 +171,7 @@ Claude (클라우드) ⇄ Claude 데스크톱 앱 ⇄ transcribe_mcp.py (stdio) 
 - `batiai/batisay-ko-turbo` (기본 한국어 엔진): BatiAI Community 라이선스. 개인·연구용은 무료, 일정 규모 이상 상업적 이용은 별도 계약 필요
 - Whisper (faster-whisper, mlx-whisper): MIT
 - `CohereLabs/cohere-transcribe-03-2026`: Apache 2.0, Hugging Face 약관 동의 필요(게이트 모델)
+- `Qwen/Qwen3-ASR-1.7B` (및 `-hf`·mlx-community 변환본): Apache 2.0
 
 ## 한계
 

@@ -57,8 +57,8 @@ def main():
         run("-m", "pip", "install", "nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10")
     apple_silicon = system == "Darwin" and platform.machine() == "arm64"
     if apple_silicon:
-        # Apple Silicon GPU(Metal)로 실행하는 MLX판 Whisper
-        run("-m", "pip", "install", "mlx-whisper")
+        # Apple Silicon GPU(Metal)로 실행하는 MLX판 Whisper와 Qwen3-ASR(mlx-audio)
+        run("-m", "pip", "install", "mlx-whisper", "mlx-audio")
     if args.amd_gpu:
         # onnxruntime(CPU)과 onnxruntime-directml은 같은 모듈 이름을 써서, CPU판을 지우고 DirectML판을 깖.
         # DirectML판에도 CPU 실행이 들어 있어 faster-whisper의 음성 구간 감지(VAD)는 그대로 동작함.

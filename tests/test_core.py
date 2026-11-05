@@ -401,3 +401,59 @@ def test_whisper_engine_uses_mlx_repo_on_apple_silicon(monkeypatch):
     list(tr.transcribe("a.m4a", "whisper", "en", "small"))
     list(tr.transcribe("a.m4a", "whisper", "en", "/local/ct2-model"))   # MLX 변환본이 없는 로컬 모델은 CPU
     assert seen == ["mlx-community/whisper-small-mlx", "cpu"]
+
+
+# ---------- Qwen3-ASR ----------
+def test_qwen_language_accepts_codes_and_names():
+    pytest.importorskip("transformers.models.qwen3_asr")
+    assert tr._qwen_language("ko") == "Korean"
+    assert tr._qwen_language("english") == "English"
+    with pytest.raises(ValueError):
+        tr._qwen_language("xx")
+
+
+def _fake_qwen_audio(monkeypatch, spans, seconds=100):
+    import numpy as np
+    monkeypatch.setattr(tr, "_qwen_language", lambda lang: "Korean")
+    monkeypatch.setattr(tr, "_decode_from", lambda audio, start: (np.zeros(seconds * tr.SR, np.float32), seconds + start))
+    monkeypatch.setattr(tr, "_speech_spans", lambda wav, sr: spans)
+
+
+def test_run_qwen_skips_silence_and_stamps_speech_start(monkeypatch):
+    _fake_qwen_audio(monkeypatch, [(5.0, 10.0), (12.0, 20.0), (70.0, 80.0)])
+    seen = []
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "cpu")
+    monkeypatch.setattr(tr, "_qwen_torch", lambda gpu=None: lambda piece, lang: seen.append(len(piece) / tr.SR) or "말")
+    rows = list(tr.run_qwen("a.m4a", start_at=30.0))
+    # 30~70초 무음 조각은 건너뛰고, 시각은 (이어하기 시작 + 말 시작 - 여유 0.2초)
+    assert [round(t, 1) for t, _ in rows] == [34.8, 99.8]
+    assert [round(x, 1) for x in seen] == [15.4, 10.4]
+
+
+def test_run_qwen_uses_mlx_and_falls_back_to_cpu(monkeypatch):
+    _fake_qwen_audio(monkeypatch, [(1.0, 3.0)], seconds=10)
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "mlx")
+    monkeypatch.setattr(tr, "_qwen_mlx", lambda: lambda piece, lang: "MLX")
+    monkeypatch.setattr(tr, "_qwen_torch", lambda gpu=None: lambda piece, lang: "CPU")
+    assert [t for _, t in tr.run_qwen("a.m4a")] == ["MLX"]
+    monkeypatch.setattr(tr, "_qwen_mlx", lambda: (_ for _ in ()).throw(ImportError("no mlx_audio")))
+    assert [t for _, t in tr.run_qwen("a.m4a")] == ["CPU"]
+
+
+def test_run_qwen_recovers_loops_by_splitting(monkeypatch):
+    _fake_qwen_audio(monkeypatch, [(0.0, 20.0)], seconds=20)
+    loop = "같은 말을 계속 반복합니다 " * 8
+    calls = []
+
+    def fake(piece, lang):
+        calls.append(len(piece))
+        return loop if len(calls) == 1 else "복구"
+    monkeypatch.setattr(tr, "gpu_backend", lambda gpu=None: "cpu")
+    monkeypatch.setattr(tr, "_qwen_torch", lambda gpu=None: fake)
+    assert [t for _, t in tr.run_qwen("a.m4a")] == ["복구 복구"]
+    assert len(calls) == 3
+
+
+def test_qwen_results_are_saved_separately(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRANSCRIBE_OUTPUT_DIR", str(tmp_path / "out"))
+    assert tr.output_path(tmp_path / "강의.m4a", "qwen").name == "강의.qwen.txt"

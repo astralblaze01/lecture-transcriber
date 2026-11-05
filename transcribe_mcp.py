@@ -208,6 +208,7 @@ def start_transcription(file_path: str, engine: str = "ko", language: str = "ko"
                         force: bool = False) -> str:
     """녹음 파일을 텍스트로 변환하는 작업을 시작하고 job_id를 돌려줍니다.
     engine: 'ko'(한국어 특화, 기본) | 'whisper'(다국어, model로 크기 선택) | 'cohere'(GPU 권장)
+            | 'qwen'(Qwen3-ASR 1.7B, 다국어·방언, 약 30초 단위 타임스탬프, Apple Silicon은 MLX)
     gpu: 비우면 지원 GPU 자동 사용, false면 CPU 강제. Intel GPU는 ko와 whisper large-v3/large-v3-turbo 지원.
     language: 'ko', 'en' 등. 이미 변환한 파일은 force=false면 저장된 결과를 바로 씁니다."""
     path = _clean_path(file_path)
